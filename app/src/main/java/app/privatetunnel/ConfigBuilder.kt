@@ -31,16 +31,56 @@ object ConfigBuilder {
         return cfg.toString(2)
     }
 
-    /** arguments for bepass-org/warp-plus */
-    fun warpArgs(mode: String, bind: String, country: String, scan: Boolean, cacheDir: String): List<String> {
+    /** arguments for bepass-org/warp-plus (base = warp|gool|none, psiphon runs inside it) */
+    fun warpArgs(base: String, psiphon: Boolean, country: String, scan: Boolean, rtt: Boolean,
+                 endpoint: String, bind: String, cacheDir: String): List<String> {
         val a = mutableListOf("--bind", bind, "--cache-dir", cacheDir)
-        when (mode) {
-            "gool" -> a += "--gool"
-            "psiphon" -> { a += "--cfon"; a += listOf("--country", country) }
-            "masque" -> a += "--masque"
-        }
-        if (scan) a += "--scan"
+        if (base == "gool") a += "--gool"
+        if (psiphon) { a += "--cfon"; a += listOf("--country", country) }
+        if (endpoint.isNotBlank()) a += listOf("--endpoint", endpoint.trim())
+        if (scan) { a += "--scan"; if (rtt) a += listOf("--rtt", "3s") }
         return a
+    }
+
+    private fun dnsBlock() = JSONObject()
+        .put("servers", JSONArray()
+            .put(JSONObject().put("tag", "l").put("address", "local"))
+            .put(JSONObject().put("tag", "d").put("address", "https://1.1.1.1/dns-query")))
+        .put("strategy", "ipv4_only")
+
+    /** one sing-box with many outbounds o0..oN; delays are measured through the clash API */
+    fun delayConfig(outs: List<JSONObject>): String {
+        val arr = JSONArray()
+        outs.forEachIndexed { i, o -> arr.put(JSONObject(o.toString()).put("tag", "o$i")) }
+        arr.put(JSONObject().put("type", "direct").put("tag", "direct"))
+        return JSONObject()
+            .put("log", JSONObject().put("level", "fatal"))
+            .put("dns", dnsBlock())
+            .put("inbounds", JSONArray().put(JSONObject().put("type", "mixed").put("tag", "idle")
+                .put("listen", "127.0.0.1").put("listen_port", 19091)))
+            .put("outbounds", arr)
+            .put("route", JSONObject().put("final", "direct"))
+            .put("experimental", JSONObject().put("clash_api",
+                JSONObject().put("external_controller", "127.0.0.1:19090")))
+            .toString()
+    }
+
+    /** one mixed inbound per outbound so each config can be speed-tested through its own port */
+    fun speedConfig(outs: List<JSONObject>, basePort: Int): String {
+        val ins = JSONArray(); val arr = JSONArray(); val rules = JSONArray()
+        outs.forEachIndexed { i, o ->
+            arr.put(JSONObject(o.toString()).put("tag", "o$i"))
+            ins.put(JSONObject().put("type", "mixed").put("tag", "in$i")
+                .put("listen", "127.0.0.1").put("listen_port", basePort + i))
+            rules.put(JSONObject().put("inbound", JSONArray().put("in$i")).put("outbound", "o$i"))
+        }
+        arr.put(JSONObject().put("type", "direct").put("tag", "direct"))
+        return JSONObject()
+            .put("log", JSONObject().put("level", "fatal"))
+            .put("dns", dnsBlock())
+            .put("inbounds", ins).put("outbounds", arr)
+            .put("route", JSONObject().put("rules", rules).put("final", "direct"))
+            .toString()
     }
 
     /** hev-socks5-tunnel yaml: TUN -> local SOCKS5, DNS is mapped (resolved remotely, no leak) */
