@@ -17,9 +17,12 @@ import kotlin.random.Random
 /** WARP / Gool through sing-box's WireGuard endpoint, with our own Cloudflare endpoint finder. */
 object Warp {
     class Id(val priv: String, val pub: String, val addrs: List<String>, val reserved: List<Int>)
-    data class Hit(val ip: String, val port: Int, val ms: Int) {
+    /** rz = true when the endpoint worked only with reserved bytes 0,0,0 */
+    data class Hit(val ip: String, val port: Int, val ms: Int, val rz: Boolean = false) {
         fun hostPort() = if (ip.contains(":")) "[$ip]:$port" else "$ip:$port"
     }
+
+    fun withReserved(id: Id, zero: Boolean) = if (zero) Id(id.priv, id.pub, id.addrs, listOf(0, 0, 0)) else id
 
     fun seed(ctx: Context) {
         if (ctx.assets.list("warp-seed")?.isNotEmpty() == true) copy(ctx, "warp-seed", File(ctx.filesDir, "warp"))
@@ -84,24 +87,26 @@ object Warp {
         return out
     }
 
-    private fun probeConfig(id: Id, batch: List<Pair<String, Int>>, base: Int): String {
+    private class Cand(val ip: String, val port: Int, val rz: Boolean)
+
+    private fun probeConfig(id: Id, batch: List<Cand>, base: Int): String {
         val ins = JSONArray(); val eps = JSONArray(); val rules = JSONArray()
-        batch.forEachIndexed { i, (ip, port) ->
+        batch.forEachIndexed { i, c ->
             ins.put(JSONObject().put("type", "mixed").put("tag", "in$i").put("listen", "127.0.0.1").put("listen_port", base + i))
-            eps.put(endpoint("w$i", id, ip, port, null, 1280).apply { remove("peers"); put("peers", JSONArray().put(
-                JSONObject().put("address", ip).put("port", port).put("public_key", id.pub)
-                    .put("allowed_ips", JSONArray().put("0.0.0.0/0").put("::/0")).put("reserved", JSONArray(id.reserved)))) })
+            eps.put(endpoint("w$i", withReserved(id, c.rz), c.ip, c.port, null, 1280))
             rules.put(JSONObject().put("inbound", JSONArray().put("in$i")).put("outbound", "w$i"))
         }
-        return JSONObject().put("log", JSONObject().put("level", "warn"))
+        return JSONObject().put("log", JSONObject().put("level", "debug"))
             .put("inbounds", ins).put("endpoints", eps)
             .put("outbounds", JSONArray().put(JSONObject().put("type", "direct").put("tag", "direct")))
             .put("route", JSONObject().put("rules", rules).put("final", "direct")).toString()
     }
 
     /**
-     * Finds Cloudflare WARP endpoints that really work from this network: one sing-box loads a batch of
-     * WireGuard endpoints and a real request is sent through each; the answer must say warp=on.
+     * Finds Cloudflare WARP endpoints that really work from this network.
+     * 1) endpoints saved from last time, 2) endpoints found by the warp-plus scanner (it is good at finding them
+     * on this kind of network, only its WireGuard engine is broken on Android), 3) a few random ones.
+     * Every candidate is verified by a real request through sing-box's WireGuard; the answer must say warp=on.
      */
     class Finder(
         private val ctx: Context,
@@ -109,64 +114,137 @@ object Warp {
         private val cancelled: () -> Boolean,
         private val status: (String) -> Unit
     ) {
-        fun find(want: Int = 2, maxBatches: Int = 10): List<Hit> {
+        private fun log(m: String) = TunnelService.log("[warp] $m")
+
+        fun find(): List<Hit> {
             val id = load(ctx, "primary") ?: error("هویت WARP داخل APK نیست؛ workflow را دوباره اجرا کن")
-            val hits = ArrayList<Hit>()
             val tried = HashSet<String>()
-            val saved = Store.warpEndpoints(ctx)
-            val custom = Store.endpoint(ctx).trim().let { s ->
-                val ip = s.substringBeforeLast(":", "").trim('[', ']'); val p = s.substringAfterLast(":", "").toIntOrNull()
-                if (ip.isNotEmpty() && p != null) ip to p else null
+            val hits = ArrayList<Hit>()
+
+            fun both(l: List<Pair<String, Int>>) = l.flatMap { listOf(Cand(it.first, it.second, false), Cand(it.first, it.second, true)) }
+
+            // 1) saved + custom
+            val pre = ArrayList<Pair<String, Int>>()
+            val s = Store.endpoint(ctx).trim()
+            val cip = s.substringBeforeLast(":", "").trim('[', ']'); val cp = s.substringAfterLast(":", "").toIntOrNull()
+            if (cip.isNotEmpty() && cp != null) pre += cip to cp
+            pre += Store.warpEndpoints(ctx).take(6)
+            if (pre.isNotEmpty()) {
+                status("بررسی endpointهای ذخیره‌شده...")
+                pre.forEach { tried += "${it.first}|${it.second}" }
+                hits += probe(id, both(pre))
             }
-            for (b in 0 until maxBatches) {
-                if (cancelled()) error("لغو شد")
-                val batch = ArrayList<Pair<String, Int>>()
-                if (b == 0) { custom?.let { batch += it }; batch += saved.take(8) }
-                batch += candidates(16 - batch.size, tried)
-                batch.forEach { tried += "${it.first}|${it.second}" }
-                status("اسکن endpoint سالم Cloudflare: دسته ${b + 1} از $maxBatches" +
-                    if (hits.isNotEmpty()) "  (پیدا شده: ${hits.size})" else "")
-                hits += probe(id, batch)
-                if (hits.size >= want || (hits.isNotEmpty() && b >= 1)) break
+
+            // 2) warp-plus scanner
+            if (hits.isEmpty() && !cancelled()) {
+                val found = harvest().filter { "${it.first}|${it.second}" !in tried }
+                if (found.isNotEmpty()) {
+                    status("تست endpointهای پیدا شده...")
+                    found.forEach { tried += "${it.first}|${it.second}" }
+                    hits += probe(id, both(found))
+                }
+            }
+
+            // 3) random
+            var b = 0
+            while (hits.isEmpty() && b < 2 && !cancelled()) {
+                status("اسکن تصادفی endpoint: دسته ${b + 1} از 2")
+                val c = candidates(16, tried); c.forEach { tried += "${it.first}|${it.second}" }
+                hits += probe(id, c.map { Cand(it.first, it.second, false) })
+                b++
             }
             val sorted = hits.sortedBy { it.ms }
             if (sorted.isNotEmpty()) Store.setWarpEndpoints(ctx, sorted.take(6).map { it.ip to it.port })
             return sorted
         }
 
-        private fun probe(id: Id, batch: List<Pair<String, Int>>): List<Hit> {
+        /** runs the warp-plus scanner only to read the endpoints it chooses, then kills it */
+        private fun harvest(): List<Pair<String, Int>> {
+            val bin = File(ctx.applicationInfo.nativeLibraryDir, "libwarp.so")
+            if (!bin.exists()) return emptyList()
+            val cache = File(ctx.filesDir, "warp").apply { mkdirs() }
+            val p = ProcessBuilder(bin.path, "--bind", "127.0.0.1:18999", "--cache-dir", cache.path, "--scan", "--rtt", "3s")
+                .directory(ctx.filesDir).redirectErrorStream(true).start()
+            procs += p
+            val found = java.util.concurrent.atomic.AtomicReference<List<Pair<String, Int>>?>(null)
+            Thread {
+                try {
+                    p.inputStream.bufferedReader().forEachLine { line ->
+                        if (line.contains("using warp endpoints")) {
+                            val m = Regex("endpoints=\"\\[(.*)\\]\"").find(line)
+                            val list = m?.groupValues?.get(1)?.split(" ")?.mapNotNull { t ->
+                                if (t.startsWith("[")) {
+                                    val ip = t.substring(1, t.indexOf("]")); val port = t.substringAfter("]:").toIntOrNull()
+                                    if (port != null) ip to port else null
+                                } else {
+                                    val port = t.substringAfterLast(":").toIntOrNull()
+                                    if (port != null) t.substringBeforeLast(":") to port else null
+                                }
+                            }?.distinct() ?: emptyList()
+                            found.set(list)
+                        }
+                    }
+                } catch (_: Exception) {}
+            }.start()
+            val t0 = System.currentTimeMillis()
+            try {
+                while (System.currentTimeMillis() - t0 < 150_000 && found.get() == null && p.isAlive && !cancelled()) {
+                    status("اسکن endpoint با اسکنر Cloudflare... ${(System.currentTimeMillis() - t0) / 1000} ثانیه (حدود ۱ دقیقه)")
+                    Thread.sleep(700)
+                }
+            } finally { try { p.destroyForcibly(); p.waitFor(2, TimeUnit.SECONDS) } catch (_: Exception) {}; procs.remove(p) }
+            if (cancelled()) error("لغو شد")
+            val r = found.get() ?: emptyList()
+            log("اسکنر warp-plus: " + r.joinToString { "${it.first}:${it.second}" }.ifEmpty { "چیزی پیدا نکرد" })
+            return r
+        }
+
+        private fun probe(id: Id, batch: List<Cand>): List<Hit> {
+            if (batch.isEmpty()) return emptyList()
             val base = 22000
             val f = File(ctx.filesDir, "wp.json").apply { writeText(probeConfig(id, batch, base)) }
             val bin = File(ctx.applicationInfo.nativeLibraryDir, "libsingbox.so")
             val p = ProcessBuilder(bin.path, "run", "-c", f.path, "-D", ctx.filesDir.path).redirectErrorStream(true).start()
             procs += p
             val out = StringBuilder()
-            Thread { try { p.inputStream.bufferedReader().forEachLine { out.appendLine(it) } } catch (_: Exception) {} }.start()
+            Thread {
+                try { p.inputStream.bufferedReader().forEachLine { out.appendLine(it); if (out.length > 20000) out.delete(0, 10000) } }
+                catch (_: Exception) {}
+            }.start()
             try {
                 var up = false
                 for (i in 0 until 40) {
                     if (cancelled()) error("لغو شد")
-                    if (!p.isAlive) error("sing-box برای WARP بالا نیامد: " + out.toString().trim().takeLast(220))
+                    if (!p.isAlive) error("sing-box برای WARP بالا نیامد: " + out.toString().trim().takeLast(250))
                     try { Socket().use { it.connect(InetSocketAddress("127.0.0.1", base), 300) }; up = true; break }
                     catch (_: Exception) { Thread.sleep(300) }
                 }
-                if (!up) error("پورت تست بالا نیامد: " + out.toString().trim().takeLast(220))
+                if (!up) error("پورت تست بالا نیامد: " + out.toString().trim().takeLast(250))
                 val res = ConcurrentLinkedQueue<Hit>()
-                val ts = batch.mapIndexed { i, (ip, port) ->
+                val errs = java.util.concurrent.ConcurrentHashMap<String, Int>()
+                val ts = batch.mapIndexed { i, c ->
                     Thread {
                         try {
                             val px = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", base + i))
-                            val c = URL("http://1.1.1.1/cdn-cgi/trace").openConnection(px) as HttpURLConnection
-                            c.connectTimeout = 8000; c.readTimeout = 8000
+                            val conn = URL("http://1.1.1.1/cdn-cgi/trace").openConnection(px) as HttpURLConnection
+                            conn.connectTimeout = 9000; conn.readTimeout = 9000
                             val t0 = System.nanoTime()
-                            val body = c.inputStream.bufferedReader().readText()
+                            val body = conn.inputStream.bufferedReader().readText()
                             if (body.contains("warp=on") || body.contains("warp=plus"))
-                                res += Hit(ip, port, ((System.nanoTime() - t0) / 1_000_000).toInt())
-                        } catch (_: Exception) {}
+                                res += Hit(c.ip, c.port, ((System.nanoTime() - t0) / 1_000_000).toInt(), c.rz)
+                            else errs.merge("بدون warp=on", 1, Int::plus)
+                        } catch (e: Exception) { errs.merge(e.javaClass.simpleName, 1, Int::plus) }
                     }.also { it.start() }
                 }
-                ts.forEach { it.join(10_000) }
-                TunnelService.log("[warp] دسته: ${res.size} سالم از ${batch.size}")
+                ts.forEach { it.join(12_000) }
+                log("تست ${batch.size} endpoint: ${res.size} سالم" +
+                    if (res.isEmpty()) "  علت: " + errs.entries.joinToString { "${it.key}=${it.value}" } else "")
+                if (res.isEmpty()) {
+                    val keep = out.lines().filter { l ->
+                        l.contains("andshake", true) || l.contains("ERROR") || l.contains("WARN") || l.contains("denied", true)
+                    }.takeLast(8)
+                    if (keep.isNotEmpty()) log("خروجی sing-box:\n" + keep.joinToString("\n") { it.take(160) })
+                }
                 return res.toList()
             } finally {
                 try { p.destroyForcibly(); p.waitFor(2, TimeUnit.SECONDS) } catch (_: Exception) {}

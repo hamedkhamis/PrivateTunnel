@@ -121,6 +121,8 @@ object Collector {
     }
 
     /** latency of a real HTTPS request through one local SOCKS port (each port is routed to one outbound) */
+    private val errs = java.util.concurrent.ConcurrentHashMap<String, Int>()
+
     private fun proxyDelay(port: Int): Int = try {
         val px = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", port))
         val c = URL(TEST_URL).openConnection(px) as HttpURLConnection
@@ -129,8 +131,8 @@ object Collector {
         val code = c.responseCode
         val ms = ((System.nanoTime() - t0) / 1_000_000).toInt()
         c.disconnect()
-        if (code == 204 || code == 200) maxOf(ms, 1) else -1
-    } catch (e: Exception) { -1 }
+        if (code == 204 || code == 200) maxOf(ms, 1) else { errs.merge("HTTP$code", 1, Int::plus); -1 }
+    } catch (e: Exception) { errs.merge(e.javaClass.simpleName + ":" + (e.message ?: "").take(30), 1, Int::plus); -1 }
 
     private fun waitFirstPort(p: Process, port: Int, out: StringBuilder): Boolean {
         repeat(40) {
@@ -158,6 +160,10 @@ object Collector {
         results.value = emptyList(); alive.value = 0; progress.value = 0 to 0
         try {
             val px = proxyFor(ctx)
+            if (Sys.vpnActive(ctx) && !TunnelService.running.value) {
+                phase.value = "خطا: یک VPN دیگر روشن است (مثلاً AetherST). اول آن را قطع کن، وگرنه تست‌ها از داخل آن رد می‌شوند."
+                return@withContext
+            }
             phase.value = "دریافت لیست‌ها از منابع آنلاین..."
             val srcs = Collector.SOURCES + Store.extraSources(ctx)
             val texts = coroutineScope { srcs.map { s -> async { fetchText(s, px) } }.awaitAll() }
@@ -224,6 +230,11 @@ object Collector {
                     }
                 } finally { try { p.destroyForcibly() } catch (_: Exception) {}; proc = null }
                 clog("دسته تمام شد؛ سالم تا الان: ${results.value.size}")
+                if (errs.isNotEmpty()) {
+                    clog("علت شکست‌ها: " + errs.entries.sortedByDescending { it.value }.take(4).joinToString { "${it.key}=${it.value}" })
+                    errs.clear()
+                }
+                if (results.value.isEmpty()) clog("خروجی sing-box: " + out.toString().trim().takeLast(350))
             }
 
             if (results.value.isNotEmpty() && !cancelled) {

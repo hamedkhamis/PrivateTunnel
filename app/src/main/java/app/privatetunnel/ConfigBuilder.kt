@@ -22,6 +22,8 @@ object ConfigBuilder {
 
         val dns = JSONArray()
         if (viaTag != null) dns.put(JSONObject().put("tag", "r").put("address", "1.1.1.1").put("detour", viaTag))
+        // DoH to 8.8.8.8 first: the local resolver does not exist for a plain linux binary on Android
+        dns.put(JSONObject().put("tag", "g").put("address", "https://8.8.8.8/dns-query"))
         dns.put(JSONObject().put("tag", "l").put("address", "local"))
 
         val cfg = JSONObject()
@@ -48,8 +50,8 @@ object ConfigBuilder {
 
     private fun dnsBlock() = JSONObject()
         .put("servers", JSONArray()
-            .put(JSONObject().put("tag", "l").put("address", "local"))
-            .put(JSONObject().put("tag", "d").put("address", "https://1.1.1.1/dns-query")))
+            .put(JSONObject().put("tag", "g").put("address", "https://8.8.8.8/dns-query"))
+            .put(JSONObject().put("tag", "l").put("address", "local")))
         .put("strategy", "ipv4_only")
 
     /** one sing-box with many outbounds o0..oN; delays are measured through the clash API */

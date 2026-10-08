@@ -97,6 +97,7 @@ class TunnelService : VpnService() {
         cancelled = false
         status.value = "آماده‌سازی..."; method.value = ""
         killProcs()
+        if (Sys.vpnActive(this)) error("یک VPN دیگر روشن است (مثلاً AetherST). اول آن را قطع کن، بعد وصل شو")
         val port = Store.port(this)
         val listen = if (Store.hotspot(this)) "0.0.0.0" else "127.0.0.1"
         val dir = filesDir
@@ -155,7 +156,7 @@ class TunnelService : VpnService() {
         val base = status.value.substringBefore("\n")
         val f = Warp.Finder(this, procs, { cancelled }, { status.value = base + "\n" + it })
         val r = f.find()
-        if (r.isEmpty()) error("هیچ endpoint سالمی از Cloudflare پیدا نشد. UDP یا IP های WARP بسته است")
+        if (r.isEmpty()) error("هیچ endpoint سالمی از Cloudflare پیدا نشد (علت دقیق در لاگ [warp])")
         log("endpointهای سالم: " + r.joinToString { "${it.hostPort()} (${it.ms}ms)" })
         foundEps = r
         return r
@@ -163,12 +164,12 @@ class TunnelService : VpnService() {
 
     private fun warpChain(key: String, hits: List<Warp.Hit>): Pair<List<org.json.JSONObject>, String> {
         val id1 = Warp.load(this, "primary") ?: error("هویت WARP داخل APK نیست")
-        val list = mutableListOf(Warp.endpoint("w1", id1, hits[0].ip, hits[0].port, null, 1280))
+        val list = mutableListOf(Warp.endpoint("w1", Warp.withReserved(id1, hits[0].rz), hits[0].ip, hits[0].port, null, 1280))
         var last = "w1"
         if (key == "gool") {
             val id2 = Warp.load(this, "secondary") ?: id1
             val o = hits.getOrElse(1) { hits[0] }
-            list += Warp.endpoint("w2", id2, o.ip, o.port, "w1", 1200)
+            list += Warp.endpoint("w2", Warp.withReserved(id2, o.rz), o.ip, o.port, "w1", 1200)
             last = "w2"
         }
         return list to last
