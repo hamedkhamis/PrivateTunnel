@@ -56,6 +56,9 @@ if [ -n "$AMD" ]; then
   for d in primary secondary; do
     if [ -d "$TMP/idcache/$d" ]; then cp -r "$TMP/idcache/$d" "$SEED/"; fi
   done
+  # Gool needs two accounts; fall back to the same one if the second was not created
+  if [ -d "$SEED/primary" ] && [ ! -d "$SEED/secondary" ]; then cp -r "$SEED/primary" "$SEED/secondary"; fi
+  test -f "$SEED/primary/wgcf-identity.json" || echo "WARNING: WARP identity was not generated"
 fi
 ls -R "$SEED" || true
 

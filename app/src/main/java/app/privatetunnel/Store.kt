@@ -65,4 +65,11 @@ object Store {
         saveProfiles(c, l + p)
         return l.size
     }
+
+    fun warpEndpoints(c: Context): List<Pair<String, Int>> =
+        sp(c).getString("warpEps", "")!!.split(",").mapNotNull {
+            val i = it.lastIndexOf("|"); if (i <= 0) null else it.substring(0, i) to (it.substring(i + 1).toIntOrNull() ?: return@mapNotNull null)
+        }
+    fun setWarpEndpoints(c: Context, l: List<Pair<String, Int>>) =
+        sp(c).edit().putString("warpEps", l.joinToString(",") { "${it.first}|${it.second}" }).apply()
 }

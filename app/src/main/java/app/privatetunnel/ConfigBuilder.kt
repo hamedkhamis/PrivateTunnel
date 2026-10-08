@@ -5,29 +5,33 @@ import org.json.JSONObject
 
 object ConfigBuilder {
 
-    /** sing-box config: one SOCKS/HTTP mixed inbound, one proxy outbound, optional detour through WARP. */
-    fun singBox(proxy: JSONObject, listen: String, port: Int, warpPort: Int?): String {
-        val p = JSONObject(proxy.toString()).put("tag", "proxy")
+    /**
+     * sing-box config with one mixed (SOCKS+HTTP) inbound.
+     * proxy = V2Ray outbound (optional), endpoints = WireGuard WARP endpoints (optional),
+     * viaTag = last endpoint; the proxy detours through it, or traffic goes straight to it.
+     */
+    fun singBox(proxy: JSONObject?, listen: String, port: Int, endpoints: List<JSONObject>, viaTag: String?): String {
         val outs = JSONArray()
-        if (warpPort != null) {
-            p.put("detour", "warp")
-            outs.put(p)
-            outs.put(JSONObject().put("type", "socks").put("tag", "warp")
-                .put("server", "127.0.0.1").put("server_port", warpPort))
-        } else outs.put(p)
+        var final = "direct"
+        if (proxy != null) {
+            val p = JSONObject(proxy.toString()).put("tag", "proxy")
+            if (viaTag != null) p.put("detour", viaTag)
+            outs.put(p); final = "proxy"
+        } else if (viaTag != null) final = viaTag
         outs.put(JSONObject().put("type", "direct").put("tag", "direct"))
+
+        val dns = JSONArray()
+        if (viaTag != null) dns.put(JSONObject().put("tag", "r").put("address", "1.1.1.1").put("detour", viaTag))
+        dns.put(JSONObject().put("tag", "l").put("address", "local"))
 
         val cfg = JSONObject()
             .put("log", JSONObject().put("level", "warn"))
-            .put("dns", JSONObject()
-                .put("servers", JSONArray()
-                    .put(JSONObject().put("tag", "d").put("address", "https://1.1.1.1/dns-query"))
-                    .put(JSONObject().put("tag", "l").put("address", "local")))
-                .put("strategy", "ipv4_only"))
+            .put("dns", JSONObject().put("servers", dns).put("strategy", "ipv4_only"))
             .put("inbounds", JSONArray().put(JSONObject().put("type", "mixed").put("tag", "in")
                 .put("listen", listen).put("listen_port", port)))
             .put("outbounds", outs)
-            .put("route", JSONObject().put("final", "proxy"))
+            .put("route", JSONObject().put("final", final))
+        if (endpoints.isNotEmpty()) cfg.put("endpoints", JSONArray(endpoints))
         return cfg.toString(2)
     }
 

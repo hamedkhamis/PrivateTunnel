@@ -188,10 +188,10 @@ fun LtrText(text: String, color: Color = MUTED, size: Int = 12, modifier: Modifi
 }
 
 private val MODES = listOf(
-    Triple("auto", "خودکار (پیشنهادی)", "خودش Psiphon، WARP و Gool را یکی‌یکی امتحان می‌کند و اولین روش سالم را نگه می‌دارد"),
-    Triple("psiphon", "Psiphon", "برای فیلترینگ سخت؛ کشور خروجی از تنظیمات"),
-    Triple("warp", "WARP", "تونل ساده و سریع Cloudflare"),
-    Triple("gool", "Gool", "WARP دوبل؛ IP متفاوت"),
+    Triple("auto", "خودکار (پیشنهادی)", "اول IP سالم Cloudflare را پیدا می‌کند، بعد WARP، Gool، Psiphon و کانفیگ را به ترتیب امتحان می‌کند"),
+    Triple("warp", "WARP", "تونل Cloudflare؛ endpoint سالم را خودش اسکن می‌کند"),
+    Triple("gool", "Gool", "WARP دوبل (تونل داخل تونل)"),
+    Triple("psiphon", "Psiphon", "برای فیلترینگ سخت؛ کشور از تنظیمات"),
     Triple("v2ray", "کانفیگ V2Ray", "یکی از کانفیگ‌ها را در تب «کانفیگ‌ها» انتخاب کن")
 )
 

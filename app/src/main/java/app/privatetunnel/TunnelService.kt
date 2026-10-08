@@ -50,6 +50,7 @@ class TunnelService : VpnService() {
     private val hev by lazy { TProxyService() }
     private var hevStarted = false
     @Volatile private var cancelled = false
+    private var foundEps: List<Warp.Hit>? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == "stop") { cancelled = true; stopAll(); stopSelf(); return START_NOT_STICKY }
@@ -79,20 +80,13 @@ class TunnelService : VpnService() {
         val t = p.inputStream.bufferedReader().readText(); p.waitFor(5, TimeUnit.SECONDS); t
     } catch (e: Exception) { "" }
 
-    private fun copyAsset(src: String, dst: File) {
-        val kids = assets.list(src)
-        if (kids.isNullOrEmpty()) {
-            if (!dst.exists()) { dst.parentFile?.mkdirs(); assets.open(src).use { i -> dst.outputStream().use { i.copyTo(it) } } }
-        } else { dst.mkdirs(); kids.forEach { copyAsset("$src/$it", File(dst, it)) } }
-    }
-
     private fun portFree(p: Int) = try {
         ServerSocket().use { it.reuseAddress = true; it.bind(InetSocketAddress("127.0.0.1", p)) }; true
     } catch (e: Exception) { false }
 
     private fun steps(mode: String): List<Step> {
         if (mode != "auto") return listOf(Step(mode))
-        val l = mutableListOf(Step("psiphon"), Step("warp"), Step("gool"))
+        val l = mutableListOf(Step("warp"), Step("gool"), Step("psiphon"))
         if (Store.selectedProfile(this) != null) l += Step("v2ray")
         val last = Store.lastGood(this)
         l.sortBy { if (it.key == last) 0 else 1 }
@@ -108,7 +102,8 @@ class TunnelService : VpnService() {
         val dir = filesDir
         val cache = File(dir, "warp").apply { mkdirs() }
         if (!portFree(port) || !portFree(port + 1)) error("پورت $port اشغال است (برنامه دیگری استفاده می‌کند)")
-        if (assets.list("warp-seed")?.isNotEmpty() == true) copyAsset("warp-seed", cache)
+        Warp.seed(this)
+        foundEps = null
         val help = helpText()
 
         val list = steps(Store.mode(this))
@@ -147,39 +142,62 @@ class TunnelService : VpnService() {
         }.start()
     }
 
-    private fun warpArgs(base: String, psiphon: Boolean, bind: String, cache: File, help: String): List<String> {
+    /** warp-plus arguments (only used for Psiphon now) */
+    private fun warpPlusArgs(psiphon: Boolean, endpoint: String, bind: String, cache: File, help: String): List<String> {
         fun need(flag: String) { if (help.isNotEmpty() && !help.contains(flag)) error("این نسخه warp-plus از $flag پشتیبانی نمی‌کند") }
-        if (base == "gool") need("--gool")
         if (psiphon) need("--cfon")
-        val ep = Store.endpoint(this)
-        if (ep.isNotBlank()) need("--endpoint")
-        val scan = Store.scan(this) && ep.isBlank()
-        if (scan) need("--scan")
-        return ConfigBuilder.warpArgs(base, psiphon, Store.country(this).ifBlank { "US" }, scan,
-            help.contains("--rtt"), ep, bind, cache.path)
+        if (endpoint.isNotBlank()) need("--endpoint")
+        return ConfigBuilder.warpArgs("warp", psiphon, Store.country(this).ifBlank { "US" }, false, false, endpoint, bind, cache.path)
+    }
+
+    private fun endpoints(): List<Warp.Hit> {
+        foundEps?.let { return it }
+        val base = status.value.substringBefore("\n")
+        val f = Warp.Finder(this, procs, { cancelled }, { status.value = base + "\n" + it })
+        val r = f.find()
+        if (r.isEmpty()) error("هیچ endpoint سالمی از Cloudflare پیدا نشد. UDP یا IP های WARP بسته است")
+        log("endpointهای سالم: " + r.joinToString { "${it.hostPort()} (${it.ms}ms)" })
+        foundEps = r
+        return r
+    }
+
+    private fun warpChain(key: String, hits: List<Warp.Hit>): Pair<List<org.json.JSONObject>, String> {
+        val id1 = Warp.load(this, "primary") ?: error("هویت WARP داخل APK نیست")
+        val list = mutableListOf(Warp.endpoint("w1", id1, hits[0].ip, hits[0].port, null, 1280))
+        var last = "w1"
+        if (key == "gool") {
+            val id2 = Warp.load(this, "secondary") ?: id1
+            val o = hits.getOrElse(1) { hits[0] }
+            list += Warp.endpoint("w2", id2, o.ip, o.port, "w1", 1200)
+            last = "w2"
+        }
+        return list to last
     }
 
     /** starts the cores for one method and checks that real traffic passes. false = try next */
     private fun tryStep(st: Step, port: Int, listen: String, dir: File, cache: File, help: String): Boolean {
         try {
             when (st.key) {
-                "psiphon", "warp", "gool" -> {
-                    val args = warpArgs(if (st.key == "gool") "gool" else "warp", st.key == "psiphon", "$listen:$port", cache, help)
-                    startCore("warp", "libwarp.so", args, dir)
-                    status.value = status.value.substringBefore("\n") + "\nاسکن endpoint سالم، تا ۲ دقیقه صبر کن"
-                    waitPort(port, 120)
+                "warp", "gool" -> {
+                    val (eps, last) = warpChain(st.key, endpoints())
+                    val cfg = File(dir, "sb.json").apply { writeText(ConfigBuilder.singBox(null, listen, port, eps, last)) }
+                    status.value = status.value.substringBefore("\n") + "\nراه‌اندازی تونل..."
+                    startCore("sing-box", "libsingbox.so", listOf("run", "-c", cfg.path, "-D", dir.path), dir)
+                    waitPort(port, 30)
+                }
+                "psiphon" -> {
+                    val ep = Store.endpoint(this).ifBlank { endpoints()[0].hostPort() }
+                    startCore("warp", "libwarp.so", warpPlusArgs(true, ep, "$listen:$port", cache, help), dir)
+                    status.value = status.value.substringBefore("\n") + "\nراه‌اندازی Psiphon..."
+                    waitPort(port, 90)
                 }
                 "v2ray" -> {
                     val p = Store.selectedProfile(this) ?: error("کانفیگی انتخاب نشده (تب کانفیگ‌ها)")
                     val out = UriParser.parse(p.uri) ?: error("این لینک پشتیبانی نمی‌شود")
                     val via = Store.via(this)
-                    var warpPort: Int? = null
-                    if (via != "none") {
-                        warpPort = port + 1
-                        startCore("warp", "libwarp.so", warpArgs(via, false, "127.0.0.1:$warpPort", cache, help), dir)
-                        waitPort(warpPort, 120)
-                    }
-                    val cfg = File(dir, "sb.json").apply { writeText(ConfigBuilder.singBox(out, listen, port, warpPort)) }
+                    var eps = emptyList<org.json.JSONObject>(); var last: String? = null
+                    if (via != "none") { val c = warpChain(via, endpoints()); eps = c.first; last = c.second }
+                    val cfg = File(dir, "sb.json").apply { writeText(ConfigBuilder.singBox(out, listen, port, eps, last)) }
                     startCore("sing-box", "libsingbox.so", listOf("run", "-c", cfg.path, "-D", dir.path), dir)
                     waitPort(port, 30)
                 }
