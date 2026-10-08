@@ -88,6 +88,16 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // write any crash to a file; it is shown in the log tab on the next start
+        val crashFile = File(filesDir, "last-crash.txt")
+        if (crashFile.exists()) {
+            TunnelService.log("--- کرش قبلی ---\n" + crashFile.readText().take(1500)); crashFile.delete()
+        }
+        val old = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            try { crashFile.writeText("thread ${t.name}\n" + android.util.Log.getStackTraceString(e)) } catch (_: Exception) {}
+            old?.uncaughtException(t, e)
+        }
         val ff = try { FontFamily(Typeface.createFromAsset(assets, "fonts/Vazirmatn-Regular.ttf")) }
                  catch (e: Throwable) { FontFamily.Default }
         setContent {
@@ -188,10 +198,13 @@ fun LtrText(text: String, color: Color = MUTED, size: Int = 12, modifier: Modifi
 }
 
 private val MODES = listOf(
-    Triple("auto", "خودکار (پیشنهادی)", "اول IP سالم Cloudflare را پیدا می‌کند، بعد WARP، Gool، Psiphon و کانفیگ را به ترتیب امتحان می‌کند"),
-    Triple("warp", "WARP", "تونل Cloudflare؛ endpoint سالم را خودش اسکن می‌کند"),
-    Triple("gool", "Gool", "WARP دوبل (تونل داخل تونل)"),
-    Triple("psiphon", "Psiphon", "برای فیلترینگ سخت؛ کشور از تنظیمات"),
+    Triple("auto", "خودکار (پیشنهادی)", "روش‌ها را به ترتیب امتحان می‌کند: MASQUE، WireGuard، Gool، Psiphon، کانفیگ"),
+    Triple("masque", "MASQUE (HTTP/2)", "همان روش اصلی AetherST؛ روی TCP 443 و شبیه وب‌گردی عادی"),
+    Triple("masque3", "MASQUE (HTTP/3)", "روی UDP/QUIC؛ سریع‌تر ولی در بعضی شبکه‌ها بسته است"),
+    Triple("wg", "WireGuard", "WireGuard روی UDP؛ endpoint را خودش اسکن می‌کند"),
+    Triple("gool", "Gool", "WireGuard داخل WireGuard (دو حلقه)"),
+    Triple("psiphon", "Psiphon + WARP", "Psiphon داخل تونل WARP؛ کشور از تنظیمات"),
+    Triple("psiphon_only", "فقط Psiphon", "بدون تونل WARP؛ Psiphon خالص"),
     Triple("v2ray", "کانفیگ V2Ray", "یکی از کانفیگ‌ها را در تب «کانفیگ‌ها» انتخاب کن")
 )
 
@@ -205,8 +218,6 @@ fun HomeTab(act: MainActivity) {
     val since by TunnelService.since.collectAsState()
     val traffic by TunnelService.traffic.collectAsState()
     var mode by remember { mutableStateOf(Store.mode(ctx)) }
-    var via by remember { mutableStateOf(Store.via(ctx)) }
-    var adv by remember { mutableStateOf(false) }
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(running) { while (running) { now = System.currentTimeMillis(); delay(1000) } }
     val locked = running || busy
@@ -244,17 +255,6 @@ fun HomeTab(act: MainActivity) {
                         Text(desc, color = MUTED, fontSize = 12.sp)
                     }
                 }
-            }
-            TextButton(onClick = { adv = !adv }) { Text(if (adv) "بستن گزینه‌های پیشرفته" else "گزینه‌های پیشرفته") }
-            if (adv) {
-                Text("کانفیگ V2Ray اول از داخل چه تونلی رد شود؟", color = MUTED, fontSize = 12.sp)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("none" to "مستقیم", "warp" to "WARP", "gool" to "Gool").forEach { (k, v) ->
-                        FilterChip(selected = via == k, enabled = !locked,
-                            onClick = { via = k; Store.setVia(ctx, k) }, label = { Text(v) })
-                    }
-                }
-                Text("ترکیب Gool با Psiphon توسط هسته پشتیبانی نمی‌شود.", color = MUTED, fontSize = 11.sp)
             }
         }
 
@@ -378,6 +378,9 @@ fun SettingsTab() {
     var port by remember { mutableStateOf(Store.port(ctx).toString()) }
     var country by remember { mutableStateOf(Store.country(ctx)) }
     var endpoint by remember { mutableStateOf(Store.endpoint(ctx)) }
+    var noise by remember { mutableStateOf(Store.noise(ctx)) }
+    var scanMode by remember { mutableStateOf(Store.scanMode(ctx)) }
+    var h2 by remember { mutableStateOf(Store.h2(ctx)) }
     var msg by remember { mutableStateOf("") }
     Column(Modifier.verticalScroll(rememberScrollState()).padding(vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -385,7 +388,21 @@ fun SettingsTab() {
         if (running) Text("برای تغییر تنظیمات اول قطع کن", color = WARN)
         Card2 {
             SwitchRow("اشتراک با هات‌اسپات", hotspot, !running) { hotspot = it; Store.setHotspot(ctx, it) }
-            SwitchRow("اسکن خودکار endpoint سالم", scan, !running) { scan = it; Store.setScan(ctx, it) }
+            SwitchRow("MASQUE روی HTTP/2 (TCP، بهتر برای شبکه‌های سخت)", h2, !running) { h2 = it; Store.setH2(ctx, it) }
+        }
+        Card2 {
+            Text("پوشش ترافیک (noise)", fontWeight = FontWeight.Bold)
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf("gfw" to "GFW", "firewall" to "Firewall", "balanced" to "متعادل", "off" to "خاموش").forEach { (k, v) ->
+                    FilterChip(selected = noise == k, enabled = !running, onClick = { noise = k; Store.setNoise(ctx, k) }, label = { Text(v) })
+                }
+            }
+            Text("حالت اسکن", fontWeight = FontWeight.Bold)
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf("turbo" to "سریع", "balanced" to "متعادل", "thorough" to "کامل", "ironclad" to "مطمئن").forEach { (k, v) ->
+                    FilterChip(selected = scanMode == k, enabled = !running, onClick = { scanMode = k; Store.setScanMode(ctx, k) }, label = { Text(v) })
+                }
+            }
         }
         Card2 {
             OutlinedTextField(value = port, onValueChange = {
@@ -394,17 +411,18 @@ fun SettingsTab() {
             }, label = { Text("پورت SOCKS5 و HTTP") }, singleLine = true, modifier = Modifier.fillMaxWidth())
             OutlinedTextField(value = country, onValueChange = {
                 country = it.uppercase().take(2); Store.setCountry(ctx, country)
-            }, label = { Text("کشور خروجی Psiphon (US, DE, NL ...)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+            }, label = { Text("کشور خروجی Psiphon (DE, NL, US؛ خالی = خودکار)") }, singleLine = true, modifier = Modifier.fillMaxWidth())
             OutlinedTextField(value = endpoint, onValueChange = {
                 endpoint = it.trim(); Store.setEndpoint(ctx, endpoint)
-            }, label = { Text("endpoint دلخواه WARP (مثلاً 162.159.192.1:2408)") }, singleLine = true,
+            }, label = { Text("endpoint دلخواه (ip:port، خالی = اسکن خودکار)") }, singleLine = true,
                 modifier = Modifier.fillMaxWidth())
         }
         Card2 {
-            Text("اگر WARP/Gool گیر کرد، هویت ذخیره‌شده را پاک کن تا از نو ساخته شود.", color = MUTED, fontSize = 12.sp)
+            Text("اگر Cloudflare هویت دستگاه را قبول نکرد، آن را پاک کن تا از نو ساخته شود.", color = MUTED, fontSize = 12.sp)
             OutlinedButton(enabled = !running, onClick = {
-                File(ctx.filesDir, "warp").deleteRecursively(); msg = "هویت پاک شد"
-            }) { Text("ریست هویت WARP") }
+                ctx.filesDir.listFiles()?.filter { it.name.startsWith("aether") && it.name.endsWith(".toml") }?.forEach { it.delete() }
+                File(ctx.filesDir, "psiphon").deleteRecursively(); msg = "هویت‌ها پاک شد"
+            }) { Text("ریست هویت Cloudflare") }
             if (msg.isNotEmpty()) Text(msg, color = OK)
         }
     }

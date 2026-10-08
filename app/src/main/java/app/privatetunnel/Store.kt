@@ -12,9 +12,13 @@ object Store {
     // mode: auto | psiphon | warp | gool | v2ray
     fun mode(c: Context) = sp(c).getString("mode", "auto")!!
     fun setMode(c: Context, v: String) = sp(c).edit().putString("mode", v).apply()
-    // v2ray mode can optionally go through WARP/Gool first: none | warp | gool
-    fun via(c: Context) = sp(c).getString("via", "none")!!
-    fun setVia(c: Context, v: String) = sp(c).edit().putString("via", v).apply()
+    // Aether tuning (defaults match AetherST's "turbo" preset)
+    fun noise(c: Context) = sp(c).getString("noise", "gfw")!!
+    fun setNoise(c: Context, v: String) = sp(c).edit().putString("noise", v).apply()
+    fun scanMode(c: Context) = sp(c).getString("scanMode", "turbo")!!
+    fun setScanMode(c: Context, v: String) = sp(c).edit().putString("scanMode", v).apply()
+    fun h2(c: Context) = sp(c).getBoolean("h2", true)
+    fun setH2(c: Context, v: Boolean) = sp(c).edit().putBoolean("h2", v).apply()
     fun lastGood(c: Context) = sp(c).getString("lastGood", "")!!
     fun setLastGood(c: Context, v: String) = sp(c).edit().putString("lastGood", v).apply()
 

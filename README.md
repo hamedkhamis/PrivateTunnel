@@ -2,21 +2,17 @@
 
 اپ شخصی اندروید برای تونل، با چند هسته متن‌باز. بیلد کامل با GitHub Actions، بدون نیاز به Android Studio.
 
-## معماری
-TUN (VpnService) -> hev-socks5-tunnel (JNI) -> SOCKS5 محلی -> یکی از هسته‌ها:
-- sing-box: VLESS/Reality, VMess, Trojan, Shadowsocks, Hysteria2, TUIC و هر outbound دیگر (ShadowTLS, AnyTLS, Naive, WireGuard) با paste کردن JSON
-- warp-plus: WARP، Gool و Psiphon بدون سرور (Psiphon می‌تواند داخل WARP یا Gool اجرا شود)
-- حالت خودکار: Psiphon، WARP و Gool را یکی‌یکی امتحان می‌کند و با درخواست واقعی اینترنت تست می‌کند
-- کانفیگ V2Ray می‌تواند اول از داخل WARP یا Gool رد شود (ترکیب Gool با Psiphon در خود warp-plus ممکن نیست)
+## معماری (همان معماری AetherST)
+TUN (VpnService) -> hev-socks5-tunnel -> SOCKS5 محلی -> یکی از هسته‌ها:
+- **Aether** (https://github.com/CluvexStudio/Aether، مجوز AGPL-3.0): MASQUE روی HTTP/2 یا HTTP/3، WireGuard، Gool و Psiphon داخل تونل WARP. اسکن endpoint و تأیید مسیر داده را خودش انجام می‌دهد.
+- **sing-box**: برای کانفیگ‌های V2Ray (VLESS/Reality، VMess، Trojan، Shadowsocks، Hysteria2، TUIC) و تست جمع‌آوری کانفیگ.
 
-DNS به صورت mapdns از راه تونل حل می‌شود (نشت DNS ندارد). هات‌اسپات: همان پورت روی 0.0.0.0 باز می‌شود.
+هویت Cloudflare روی سرور GitHub (خارج از ایران) با `aether --register all` ساخته و داخل APK گذاشته می‌شود؛ اگر نبود، خود Aether روی گوشی ثبت‌نام می‌کند. DNS از طریق تونل حل می‌شود. هات‌اسپات: همان پورت روی 0.0.0.0.
 
 ## راه‌اندازی
-1. ریپو را روی GitHub بساز (private هم می‌شود) و همه فایل‌ها را push کن.
-2. تب Actions را باز کن، workflow به نام Build APK خودش اجرا می‌شود (یا Run workflow).
-3. بعد از چند دقیقه APK در Releases است. نصبش کن.
-4. هر دوشنبه خودکار با آخرین نسخه هسته‌ها دوباره بیلد می‌شود.
-
+1. فایل‌ها را در یک ریپوی private گیت‌هاب push کن.
+2. Actions > Build APK (خودش اجرا می‌شود یا Run workflow).
+3. APK در Releases است.
 ### امضای ثابت (مهم برای آپدیت روی همان نصب)
 یک بار keystore بساز:
     keytool -genkeypair -v -keystore release.jks -alias pt -keyalg RSA -keysize 2048 -validity 36500

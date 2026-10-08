@@ -5,73 +5,28 @@ import org.json.JSONObject
 
 object ConfigBuilder {
 
-    /**
-     * sing-box config with one mixed (SOCKS+HTTP) inbound.
-     * proxy = V2Ray outbound (optional), endpoints = WireGuard WARP endpoints (optional),
-     * viaTag = last endpoint; the proxy detours through it, or traffic goes straight to it.
-     */
-    fun singBox(proxy: JSONObject?, listen: String, port: Int, endpoints: List<JSONObject>, viaTag: String?): String {
-        val outs = JSONArray()
-        var final = "direct"
-        if (proxy != null) {
-            val p = JSONObject(proxy.toString()).put("tag", "proxy")
-            if (viaTag != null) p.put("detour", viaTag)
-            outs.put(p); final = "proxy"
-        } else if (viaTag != null) final = viaTag
-        outs.put(JSONObject().put("type", "direct").put("tag", "direct"))
-
-        val dns = JSONArray()
-        if (viaTag != null) dns.put(JSONObject().put("tag", "r").put("address", "1.1.1.1").put("detour", viaTag))
-        // DoH to 8.8.8.8 first: the local resolver does not exist for a plain linux binary on Android
-        dns.put(JSONObject().put("tag", "g").put("address", "https://8.8.8.8/dns-query"))
-        dns.put(JSONObject().put("tag", "l").put("address", "local"))
-
-        val cfg = JSONObject()
-            .put("log", JSONObject().put("level", "warn"))
-            .put("dns", JSONObject().put("servers", dns).put("strategy", "ipv4_only"))
-            .put("inbounds", JSONArray().put(JSONObject().put("type", "mixed").put("tag", "in")
-                .put("listen", listen).put("listen_port", port)))
-            .put("outbounds", outs)
-            .put("route", JSONObject().put("final", final))
-        if (endpoints.isNotEmpty()) cfg.put("endpoints", JSONArray(endpoints))
-        return cfg.toString(2)
-    }
-
-    /** arguments for bepass-org/warp-plus (base = warp|gool|none, psiphon runs inside it) */
-    fun warpArgs(base: String, psiphon: Boolean, country: String, scan: Boolean, rtt: Boolean,
-                 endpoint: String, bind: String, cacheDir: String): List<String> {
-        val a = mutableListOf("--bind", bind, "--cache-dir", cacheDir)
-        if (base == "gool") a += "--gool"
-        if (psiphon) { a += "--cfon"; a += listOf("--country", country) }
-        if (endpoint.isNotBlank()) a += listOf("--endpoint", endpoint.trim())
-        if (scan) { a += "--scan"; if (rtt) a += listOf("--rtt", "3s") }
-        return a
-    }
-
     private fun dnsBlock() = JSONObject()
         .put("servers", JSONArray()
             .put(JSONObject().put("tag", "g").put("address", "https://8.8.8.8/dns-query"))
             .put(JSONObject().put("tag", "l").put("address", "local")))
         .put("strategy", "ipv4_only")
 
-    /** one sing-box with many outbounds o0..oN; delays are measured through the clash API */
-    fun delayConfig(outs: List<JSONObject>): String {
-        val arr = JSONArray()
-        outs.forEachIndexed { i, o -> arr.put(JSONObject(o.toString()).put("tag", "o$i")) }
-        arr.put(JSONObject().put("type", "direct").put("tag", "direct"))
+    /** sing-box config for one V2Ray outbound behind a local mixed (SOCKS+HTTP) inbound */
+    fun singBox(proxy: JSONObject, listen: String, port: Int): String {
+        val outs = JSONArray()
+            .put(JSONObject(proxy.toString()).put("tag", "proxy"))
+            .put(JSONObject().put("type", "direct").put("tag", "direct"))
         return JSONObject()
-            .put("log", JSONObject().put("level", "fatal"))
+            .put("log", JSONObject().put("level", "warn"))
             .put("dns", dnsBlock())
-            .put("inbounds", JSONArray().put(JSONObject().put("type", "mixed").put("tag", "idle")
-                .put("listen", "127.0.0.1").put("listen_port", 19091)))
-            .put("outbounds", arr)
-            .put("route", JSONObject().put("final", "direct"))
-            .put("experimental", JSONObject().put("clash_api",
-                JSONObject().put("external_controller", "127.0.0.1:19090")))
-            .toString()
+            .put("inbounds", JSONArray().put(JSONObject().put("type", "mixed").put("tag", "in")
+                .put("listen", listen).put("listen_port", port)))
+            .put("outbounds", outs)
+            .put("route", JSONObject().put("final", "proxy"))
+            .toString(2)
     }
 
-    /** one mixed inbound per outbound so each config can be speed-tested through its own port */
+    /** one mixed inbound per outbound so each config can be tested through its own local port */
     fun speedConfig(outs: List<JSONObject>, basePort: Int): String {
         val ins = JSONArray(); val arr = JSONArray(); val rules = JSONArray()
         outs.forEachIndexed { i, o ->
@@ -89,10 +44,10 @@ object ConfigBuilder {
             .toString()
     }
 
-    /** hev-socks5-tunnel yaml: TUN -> local SOCKS5, DNS is mapped (resolved remotely, no leak) */
-    fun hev(socksPort: Int) = """
+    /** hev-socks5-tunnel yaml (same layout AetherST uses): TUN -> local SOCKS5, DNS is mapped (resolved remotely) */
+    fun hev(socksPort: Int, mtu: Int) = """
 tunnel:
-  mtu: 1500
+  mtu: $mtu
   ipv4: 198.18.0.1
   ipv6: 'fd00::1'
 socks5:
@@ -105,5 +60,9 @@ mapdns:
   network: 100.64.0.0
   netmask: 255.192.0.0
   cache-size: 10000
+misc:
+  log-level: warn
+  connect-timeout: 5000
+  read-write-timeout: 60000
 """.trimIndent()
 }

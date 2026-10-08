@@ -16,8 +16,13 @@ import java.net.Proxy
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.URL
+import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.TimeUnit
 
+/**
+ * Same design as AetherST: the Aether core (a separate process) exposes a local SOCKS5 port,
+ * hev-socks5-tunnel bridges the VpnService TUN to that port.
+ */
 class TunnelService : VpnService() {
 
     companion object {
@@ -37,20 +42,22 @@ class TunnelService : VpnService() {
         } catch (e: Exception) { emptyList() }
 
         fun modeLabel(k: String) = when (k) {
-            "auto" -> "خودکار"; "psiphon" -> "Psiphon"; "warp" -> "WARP"; "gool" -> "Gool"
-            "v2ray" -> "کانفیگ V2Ray"; else -> k
+            "auto" -> "خودکار"; "masque" -> "MASQUE (HTTP/2)"; "masque3" -> "MASQUE (HTTP/3)"
+            "wg" -> "WireGuard"; "gool" -> "Gool"; "psiphon" -> "Psiphon + WARP"
+            "psiphon_only" -> "فقط Psiphon"; "v2ray" -> "کانفیگ V2Ray"; else -> k
         }
     }
 
     private data class Step(val key: String)
 
     private val procs = mutableListOf<Process>()
+    private val tail = ConcurrentLinkedDeque<String>()
     private var tun: ParcelFileDescriptor? = null
+    private var dupFd: ParcelFileDescriptor? = null
     private var worker: Thread? = null
     private val hev by lazy { TProxyService() }
     private var hevStarted = false
     @Volatile private var cancelled = false
-    private var foundEps: List<Warp.Hit>? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == "stop") { cancelled = true; stopAll(); stopSelf(); return START_NOT_STICKY }
@@ -58,8 +65,8 @@ class TunnelService : VpnService() {
         if (worker?.isAlive != true) {
             busy.value = true
             worker = Thread {
-                try { startAll() } catch (e: Exception) {
-                    val m = e.message ?: "نامشخص"
+                try { startAll() } catch (e: Throwable) {   // Throwable: native-library errors must not kill the app
+                    val m = e.message ?: e.javaClass.simpleName
                     log("خطا: $m"); stopAll(); status.value = if (cancelled) "" else "خطا: $m"; stopSelf()
                 } finally { busy.value = false }
             }.also { it.start() }
@@ -74,11 +81,12 @@ class TunnelService : VpnService() {
             .setContentText("اتصال فعال است").setSmallIcon(R.drawable.ic_launcher).setOngoing(true).build()
     }
 
-    private fun helpText(): String = try {
-        val p = ProcessBuilder(File(applicationInfo.nativeLibraryDir, "libwarp.so").path, "--help")
-            .redirectErrorStream(true).start()
-        val t = p.inputStream.bufferedReader().readText(); p.waitFor(5, TimeUnit.SECONDS); t
-    } catch (e: Exception) { "" }
+    private fun copyAsset(src: String, dst: File) {
+        val kids = assets.list(src)
+        if (kids.isNullOrEmpty()) {
+            if (!dst.exists()) { dst.parentFile?.mkdirs(); assets.open(src).use { i -> dst.outputStream().use { i.copyTo(it) } } }
+        } else { dst.mkdirs(); kids.forEach { copyAsset("$src/$it", File(dst, it)) } }
+    }
 
     private fun portFree(p: Int) = try {
         ServerSocket().use { it.reuseAddress = true; it.bind(InetSocketAddress("127.0.0.1", p)) }; true
@@ -86,7 +94,7 @@ class TunnelService : VpnService() {
 
     private fun steps(mode: String): List<Step> {
         if (mode != "auto") return listOf(Step(mode))
-        val l = mutableListOf(Step("warp"), Step("gool"), Step("psiphon"))
+        val l = mutableListOf(Step("masque"), Step("masque3"), Step("wg"), Step("gool"), Step("psiphon"))
         if (Store.selectedProfile(this) != null) l += Step("v2ray")
         val last = Store.lastGood(this)
         l.sortBy { if (it.key == last) 0 else 1 }
@@ -101,11 +109,9 @@ class TunnelService : VpnService() {
         val port = Store.port(this)
         val listen = if (Store.hotspot(this)) "0.0.0.0" else "127.0.0.1"
         val dir = filesDir
-        val cache = File(dir, "warp").apply { mkdirs() }
         if (!portFree(port) || !portFree(port + 1)) error("پورت $port اشغال است (برنامه دیگری استفاده می‌کند)")
-        Warp.seed(this)
-        foundEps = null
-        val help = helpText()
+        // identities pre-registered by the build (outside Iran); Aether keeps them and registers only if missing
+        if (assets.list("aether-seed")?.isNotEmpty() == true) copyAsset("aether-seed", dir)
 
         val list = steps(Store.mode(this))
         var used = ""
@@ -114,21 +120,25 @@ class TunnelService : VpnService() {
             val label = modeLabel(st.key)
             status.value = if (list.size > 1) "تلاش ${i + 1} از ${list.size}: $label" else "اتصال با $label..."
             log("--- تلاش: $label")
-            if (tryStep(st, port, listen, dir, cache, help)) { used = st.key; break }
+            if (tryStep(st, port, listen, dir)) { used = st.key; break }
             killProcs()
         }
-        if (used.isEmpty()) error("هیچ روشی وصل نشد. تب «تست» را ببین و بعد دوباره امتحان کن")
+        if (used.isEmpty()) error("هیچ روشی وصل نشد. لاگ را ببین")
         if (Store.mode(this) == "auto") Store.setLastGood(this, used)
         if (cancelled) error("لغو شد")
 
         status.value = "ساخت تونل..."
-        val b = Builder().setSession("PrivateTunnel").setMtu(1500)
-            .addAddress("198.18.0.1", 32).addAddress("fd00::1", 126)
+        val mtu = 1320
+        val b = Builder().setSession("PrivateTunnel").setMtu(mtu)
+            .addAddress("198.18.0.1", 24).addAddress("fd00::1", 120)
             .addRoute("0.0.0.0", 0).addRoute("::", 0).addDnsServer("198.18.0.2")
         b.addDisallowedApplication(packageName)
         tun = b.establish() ?: error("VPN ساخته نشد (مجوز داده نشده؟)")
-        val conf = File(dir, "hev.yml").apply { writeText(ConfigBuilder.hev(port)) }
-        hev.start(conf.path, tun!!.fd)
+        val dup = ParcelFileDescriptor.dup(tun!!.fileDescriptor)   // hev owns this copy
+        dupFd = dup
+        val conf = File(dir, "hev.yml").apply { writeText(ConfigBuilder.hev(port, mtu)) }
+        log("شروع hev با fd=${dup.fd}")
+        hev.start(conf.path, dup.fd)
         hevStarted = true
         method.value = modeLabel(used)
         since.value = System.currentTimeMillis()
@@ -143,66 +153,79 @@ class TunnelService : VpnService() {
         }.start()
     }
 
-    /** warp-plus arguments (only used for Psiphon now) */
-    private fun warpPlusArgs(psiphon: Boolean, endpoint: String, bind: String, cache: File, help: String): List<String> {
-        fun need(flag: String) { if (help.isNotEmpty() && !help.contains(flag)) error("این نسخه warp-plus از $flag پشتیبانی نمی‌کند") }
-        if (psiphon) need("--cfon")
-        if (endpoint.isNotBlank()) need("--endpoint")
-        return ConfigBuilder.warpArgs("warp", psiphon, Store.country(this).ifBlank { "US" }, false, false, endpoint, bind, cache.path)
-    }
+    /** command line and environment for the Aether core, same flags AetherST passes */
+    private fun aetherCommand(key: String, listen: String, port: Int, dir: File): Triple<List<String>, Map<String, String>, Int> {
+        val lib = applicationInfo.nativeLibraryDir
+        val bin = File(lib, "libaether.so").path
+        val psi = File(lib, "libpsiphon.so").path
+        val noise = Store.noise(this); val scan = Store.scanMode(this)
+        val h2 = Store.h2(this)
+        val args = mutableListOf(bin)
+        val env = mutableMapOf<String, String>()
+        val psiphon = key == "psiphon" || key == "psiphon_only"
+        // with --psiphon the proxy the app uses is the psiphon one, so the core's own SOCKS moves to port+1
+        val bind = if (key == "psiphon") "127.0.0.1:${port + 1}" else "$listen:$port"
+        args += listOf("--bind", bind, "--dual", "--quick-reconnect", "--validate-secs", "10", "--reconnect-secs", "2")
+        env["AETHER_SOCKS"] = bind
+        env["AETHER_SCAN"] = scan
+        env["AETHER_NOIZE"] = noise
+        env["AETHER_IP"] = "Dual"
+        env["AETHER_QUICK_RECONNECT"] = "1"
+        env["AETHER_REPROVISION"] = "1"
+        env["AETHER_LOG_LEVEL"] = "info"
+        env["AETHER_MASQUE_VALIDATE_SECS"] = "10"; env["AETHER_WG_VALIDATE_SECS"] = "10"
+        env["AETHER_MASQUE_RECONNECT_SECS"] = "2"; env["AETHER_WG_RECONNECT_SECS"] = "2"
+        val peer = Store.endpoint(this).trim()
+        if (peer.isNotEmpty()) { args += listOf("--peer", peer); env["AETHER_PEER"] = peer }
 
-    private fun endpoints(): List<Warp.Hit> {
-        foundEps?.let { return it }
-        val base = status.value.substringBefore("\n")
-        val f = Warp.Finder(this, procs, { cancelled }, { status.value = base + "\n" + it })
-        val r = f.find()
-        if (r.isEmpty()) error("هیچ endpoint سالمی از Cloudflare پیدا نشد (علت دقیق در لاگ [warp])")
-        log("endpointهای سالم: " + r.joinToString { "${it.hostPort()} (${it.ms}ms)" })
-        foundEps = r
-        return r
-    }
-
-    private fun warpChain(key: String, hits: List<Warp.Hit>): Pair<List<org.json.JSONObject>, String> {
-        val id1 = Warp.load(this, "primary") ?: error("هویت WARP داخل APK نیست")
-        val list = mutableListOf(Warp.endpoint("w1", Warp.withReserved(id1, hits[0].rz), hits[0].ip, hits[0].port, null, 1280))
-        var last = "w1"
-        if (key == "gool") {
-            val id2 = Warp.load(this, "secondary") ?: id1
-            val o = hits.getOrElse(1) { hits[0] }
-            list += Warp.endpoint("w2", Warp.withReserved(id2, o.rz), o.ip, o.port, "w1", 1200)
-            last = "w2"
+        var wait = 120
+        when (key) {
+            "masque", "masque3", "psiphon" -> {
+                env["AETHER_PROTOCOL"] = "masque"
+                val useH2 = key == "masque" || key == "psiphon"
+                if (useH2 && h2) { args += "--h2"; env["AETHER_MASQUE_HTTP2"] = "1" }
+                if (key == "masque3") env["AETHER_MASQUE_HTTP2"] = "0"
+            }
+            "wg" -> {
+                env["AETHER_PROTOCOL"] = "wg"
+                args += listOf("--keepalive", "5"); env["AETHER_WG_KEEPALIVE"] = "5"
+            }
+            "gool" -> {
+                env["AETHER_PROTOCOL"] = "gool"; wait = 150
+                args += listOf("--keepalive", "5"); env["AETHER_WG_KEEPALIVE"] = "5"
+                if (peer.isEmpty()) { args += "--wiw-scan"; env["AETHER_WIW_PEERS"] = "auto" }
+            }
+            "psiphon_only" -> { /* plain psiphon, no WARP tunnel */ }
         }
-        return list to last
+        if (psiphon) {
+            wait = 220
+            val region = Store.country(this).trim()
+            args += if (key == "psiphon") listOf("--psiphon", "--psiphon-bind", "$listen:$port") else listOf("--psiphon-only")
+            args += listOf("--psiphon-bin", psi, "--psiphon-dir", File(dir, "psiphon").apply { mkdirs() }.path)
+            if (region.length == 2) args += listOf("--psiphon-region", region.uppercase())
+            env["AETHER_PSIPHON_BIN"] = psi
+            env["AETHER_PSIPHON_READY_SECS"] = "180"
+        }
+        return Triple(args, env, wait)
     }
 
-    /** starts the cores for one method and checks that real traffic passes. false = try next */
-    private fun tryStep(st: Step, port: Int, listen: String, dir: File, cache: File, help: String): Boolean {
+    private fun tryStep(st: Step, port: Int, listen: String, dir: File): Boolean {
         try {
             when (st.key) {
-                "warp", "gool" -> {
-                    val (eps, last) = warpChain(st.key, endpoints())
-                    val cfg = File(dir, "sb.json").apply { writeText(ConfigBuilder.singBox(null, listen, port, eps, last)) }
-                    status.value = status.value.substringBefore("\n") + "\nراه‌اندازی تونل..."
-                    startCore("sing-box", "libsingbox.so", listOf("run", "-c", cfg.path, "-D", dir.path), dir)
-                    waitPort(port, 30)
-                }
-                "psiphon" -> {
-                    val ep = Store.endpoint(this).ifBlank { endpoints()[0].hostPort() }
-                    startCore("warp", "libwarp.so", warpPlusArgs(true, ep, "$listen:$port", cache, help), dir)
-                    status.value = status.value.substringBefore("\n") + "\nراه‌اندازی Psiphon..."
-                    waitPort(port, 90)
-                }
                 "v2ray" -> {
                     val p = Store.selectedProfile(this) ?: error("کانفیگی انتخاب نشده (تب کانفیگ‌ها)")
                     val out = UriParser.parse(p.uri) ?: error("این لینک پشتیبانی نمی‌شود")
-                    val via = Store.via(this)
-                    var eps = emptyList<org.json.JSONObject>(); var last: String? = null
-                    if (via != "none") { val c = warpChain(via, endpoints()); eps = c.first; last = c.second }
-                    val cfg = File(dir, "sb.json").apply { writeText(ConfigBuilder.singBox(out, listen, port, eps, last)) }
-                    startCore("sing-box", "libsingbox.so", listOf("run", "-c", cfg.path, "-D", dir.path), dir)
+                    val cfg = File(dir, "sb.json").apply { writeText(ConfigBuilder.singBox(out, listen, port)) }
+                    startCore("sing-box", listOf(File(applicationInfo.nativeLibraryDir, "libsingbox.so").path,
+                        "run", "-c", cfg.path, "-D", dir.path), emptyMap(), dir)
                     waitPort(port, 30)
                 }
-                else -> error("روش ناشناخته")
+                else -> {
+                    val (args, env, wait) = aetherCommand(st.key, listen, port, dir)
+                    startCore("aether", args, env, dir)
+                    status.value = status.value.substringBefore("\n") + "\nراه‌اندازی هسته Aether (اسکن و تأیید مسیر)..."
+                    waitPort(port, wait)
+                }
             }
             status.value = status.value.substringBefore("\n") + "\nبررسی اینترنت..."
             if (!verify(port)) error("پورت بالا آمد ولی اینترنت از این مسیر کار نکرد")
@@ -228,25 +251,48 @@ class TunnelService : VpnService() {
         return false
     }
 
-    private fun startCore(name: String, lib: String, args: List<String>, dir: File) {
-        val bin = File(applicationInfo.nativeLibraryDir, lib)
+    private fun noteLine(line: String) {
+        val l = line.lowercase()
+        val hint = when {
+            "tunnel validated" in l || "data-plane verification passed" in l -> "مسیر تأیید شد"
+            "enrolling" in l || "regist" in l || "provision" in l -> "ثبت دستگاه در Cloudflare..."
+            "scanning" in l || "sweep" in l -> "اسکن gateway سالم..."
+            "validat" in l -> "تست مسیر داده..."
+            "psiphon" in l -> "راه‌اندازی Psiphon..."
+            else -> null
+        }
+        if (hint != null) status.value = status.value.substringBefore("\n") + "\n" + hint
+    }
+
+    private fun startCore(name: String, cmd: List<String>, env: Map<String, String>, dir: File) {
+        val bin = File(cmd[0])
         if (!bin.exists()) error("هسته $name داخل APK نیست")
-        log("اجرا: $name ${args.joinToString(" ")}")
-        val pb = ProcessBuilder(listOf(bin.path) + args).directory(dir).redirectErrorStream(true)
+        log("اجرا: $name ${cmd.drop(1).joinToString(" ")}")
+        val pb = ProcessBuilder(cmd).directory(dir).redirectErrorStream(true)
         pb.environment()["HOME"] = dir.path
+        pb.environment()["TMPDIR"] = cacheDir.path
+        pb.environment().putAll(env)
+        tail.clear()
         val p = pb.start(); procs += p
-        Thread { try { p.inputStream.bufferedReader().forEachLine { log("[$name] $it") } } catch (_: Exception) {} }.start()
+        Thread {
+            try {
+                p.inputStream.bufferedReader().forEachLine { l ->
+                    log("[$name] $l"); tail.addLast(l.take(160)); while (tail.size > 6) tail.pollFirst()
+                    if (name == "aether") noteLine(l)
+                }
+            } catch (_: Exception) {}
+        }.start()
     }
 
     private fun waitPort(port: Int, seconds: Int) {
         val end = System.currentTimeMillis() + seconds * 1000L
         while (System.currentTimeMillis() < end) {
             if (cancelled) error("لغو شد")
-            if (procs.any { !it.isAlive }) error("هسته متوقف شد")
+            if (procs.any { !it.isAlive }) error("هسته متوقف شد: " + tail.toList().takeLast(3).joinToString(" | "))
             try { Socket().use { it.connect(InetSocketAddress("127.0.0.1", port), 300) }; return }
             catch (_: Exception) { Thread.sleep(400) }
         }
-        error("پورت $port در $seconds ثانیه بالا نیامد")
+        error("پورت $port در $seconds ثانیه بالا نیامد: " + tail.toList().takeLast(2).joinToString(" | "))
     }
 
     private fun killProcs() {
@@ -256,8 +302,10 @@ class TunnelService : VpnService() {
 
     private fun stopAll() {
         running.value = false
-        try { if (hevStarted) hev.stop() } catch (_: Throwable) {}
+        try { if (hevStarted) { hev.stop(); Thread.sleep(300) } } catch (_: Throwable) {}
         hevStarted = false
+        try { dupFd?.close() } catch (_: Exception) {}
+        dupFd = null
         try { tun?.close() } catch (_: Exception) {}
         tun = null
         killProcs()

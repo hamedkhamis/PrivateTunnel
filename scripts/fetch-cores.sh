@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Downloads / builds the native cores and places them in jniLibs as lib*.so
+# Cores: Aether (WARP over MASQUE / WireGuard / Gool + Psiphon), sing-box (V2Ray configs), hev-socks5-tunnel (TUN bridge)
 # Every network step is retried, because the GitHub API sometimes answers 502/504.
 set -euo pipefail
 OUT="$PWD/app/src/main/jniLibs/arm64-v8a"
@@ -17,14 +18,48 @@ retry() {
 }
 curlr() { curl -fsSL --retry 5 --retry-all-errors --retry-delay 4 "$@"; }
 
-# ---------------------------------------------------------------- sing-box
+# ---------------------------------------------------------------- Aether core (same core AetherST uses)
+echo "== aether =="
+aether_url() {  # $1 = android-arm64 | linux-x86_64
+  local u
+  u=$(retry gh api repos/CluvexStudio/Aether/releases/latest --jq '.assets[].browser_download_url' 2>/dev/null \
+      | grep -E "aether-$1\.tar\.gz$" | head -1 || true)
+  if [ -z "$u" ]; then u="https://github.com/CluvexStudio/Aether/releases/latest/download/aether-$1.tar.gz"; fi
+  echo "$u"
+}
+AU=$(aether_url android-arm64)
+echo "using $AU"
+curlr "$AU" -o "$TMP/aether-android.tgz"
+mkdir -p "$TMP/ae"; tar -xzf "$TMP/aether-android.tgz" -C "$TMP/ae"
+cp "$TMP/ae/aether" "$OUT/libaether.so"
+if [ -f "$TMP/ae/pt/psiphon-tunnel-core" ]; then cp "$TMP/ae/pt/psiphon-tunnel-core" "$OUT/libpsiphon.so"; else echo "WARNING: psiphon-tunnel-core not in archive"; fi
+
+# pre-register the Cloudflare identities on the runner (outside Iran), so the phone does not have to
+echo "== aether identities =="
+SEED="$PWD/app/src/main/assets/aether-seed"
+rm -rf "$SEED"; mkdir -p "$SEED" "$TMP/reg"
+LU=$(aether_url linux-x86_64 || true)
+if [ -n "$LU" ] && curlr "$LU" -o "$TMP/aether-linux.tgz"; then
+  mkdir -p "$TMP/al"; tar -xzf "$TMP/aether-linux.tgz" -C "$TMP/al"
+  chmod +x "$TMP/al/aether"
+  ( cd "$TMP/reg" && timeout 120 "$TMP/al/aether" --register all < /dev/null > "$TMP/reg.log" 2>&1 || true )
+  tail -n 15 "$TMP/reg.log" || true
+  for f in "$TMP"/reg/aether*.toml; do
+    [ -e "$f" ] || continue
+    case "$f" in *lastconn*) continue;; esac
+    cp "$f" "$SEED/"
+  done
+fi
+ls -la "$SEED" || true
+test -n "$(ls -A "$SEED" 2>/dev/null)" || echo "WARNING: no Aether identity pre-registered (the phone will register itself)"
+
+# ---------------------------------------------------------------- sing-box (V2Ray configs, collector)
 echo "== sing-box =="
 TAG=""
 if LIST=$(retry gh api "repos/SagerNet/sing-box/releases?per_page=40" -q '.[].tag_name'); then
   TAG=$(echo "$LIST" | grep -E '^v1\.11\.[0-9]+$' | sort -V | tail -1 || true)
 fi
 echo "latest 1.11.x from API: ${TAG:-none}"
-
 get_sb() {
   local T="$1" V="${1#v}" plat b
   for plat in android linux; do
@@ -37,28 +72,12 @@ get_sb() {
   done
   return 1
 }
-
 GOT=0
 for T in $TAG v1.11.15 v1.11.14 v1.11.13 v1.11.11 v1.11.9 v1.11.4; do
   [ -z "$T" ] && continue
   if get_sb "$T"; then GOT=1; break; fi
 done
 if [ "$GOT" != 1 ]; then echo "ERROR: could not download sing-box"; exit 1; fi
-
-# ---------------------------------------------------------------- warp-plus
-echo "== warp-plus =="
-warp_url() {  # $1 = arm64|amd64
-  local u
-  u=$(retry gh api repos/bepass-org/warp-plus/releases/latest --jq '.assets[].browser_download_url' 2>/dev/null \
-      | grep -i "linux-$1" | grep -i '\.zip$' | head -1 || true)
-  if [ -z "$u" ]; then u="https://github.com/bepass-org/warp-plus/releases/latest/download/warp-plus_linux-$1.zip"; fi
-  echo "$u"
-}
-URL=$(warp_url arm64)
-echo "using $URL"
-curlr "$URL" -o "$TMP/warp.zip"
-unzip -o "$TMP/warp.zip" -d "$TMP/warp" >/dev/null
-cp "$(find "$TMP/warp" -type f -name 'warp-plus*' ! -name '*.zip' | head -1)" "$OUT/libwarp.so"
 
 # ---------------------------------------------------------------- hev-socks5-tunnel (JNI)
 echo "== hev-socks5-tunnel =="
@@ -73,37 +92,6 @@ echo 'include $(call all-subdir-makefiles)' > "$TMP/hev/jni/Android.mk"
 ( cd "$TMP/hev" && "$NDK/ndk-build" NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=jni/Android.mk \
     APP_ABI=arm64-v8a APP_PLATFORM=android-26 NDK_LIBS_OUT="$TMP/hev/libs" NDK_OUT="$TMP/hev/obj" )
 cp "$TMP/hev/libs/arm64-v8a/libhev-socks5-tunnel.so" "$OUT/"
-
-# ---------------------------------------------------------------- WARP identities (registered outside Iran)
-echo "== WARP identities =="
-SEED="$PWD/app/src/main/assets/warp-seed"
-rm -rf "$SEED"; mkdir -p "$SEED" "$TMP/idcache"
-AMD=$(warp_url amd64 || true)
-if [ -n "$AMD" ] && curlr "$AMD" -o "$TMP/warp-amd.zip"; then
-  unzip -o "$TMP/warp-amd.zip" -d "$TMP/warp-amd" >/dev/null
-  BIN=$(find "$TMP/warp-amd" -type f -name 'warp-plus*' ! -name '*.zip' | head -1)
-  chmod +x "$BIN"
-  for attempt in 1 2 3; do
-    rm -rf "$TMP/idcache"; mkdir -p "$TMP/idcache"
-    "$BIN" --gool --bind 127.0.0.1:18080 --cache-dir "$TMP/idcache" > "$TMP/id.log" 2>&1 &
-    PID=$!
-    for i in $(seq 1 45); do
-      if [ -f "$TMP/idcache/primary/wgcf-identity.json" ] && [ -f "$TMP/idcache/secondary/wgcf-identity.json" ]; then break; fi
-      sleep 2
-    done
-    kill $PID 2>/dev/null || true
-    tail -n 6 "$TMP/id.log" || true
-    if [ -f "$TMP/idcache/primary/wgcf-identity.json" ]; then break; fi
-    echo "identity attempt $attempt failed, retrying"; sleep 8
-  done
-  for d in primary secondary; do
-    if [ -d "$TMP/idcache/$d" ]; then cp -r "$TMP/idcache/$d" "$SEED/"; fi
-  done
-  # Gool needs two accounts; fall back to the same one if the second was not created
-  if [ -d "$SEED/primary" ] && [ ! -d "$SEED/secondary" ]; then cp -r "$SEED/primary" "$SEED/secondary"; fi
-fi
-test -f "$SEED/primary/wgcf-identity.json" || echo "WARNING: WARP identity was not generated"
-ls -R "$SEED" || true
 
 # ---------------------------------------------------------------- font
 echo "== Vazirmatn font =="
