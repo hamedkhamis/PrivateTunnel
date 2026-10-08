@@ -9,13 +9,14 @@ data class Profile(val name: String, val uri: String)
 object Store {
     private fun sp(c: Context) = c.getSharedPreferences("pt", Context.MODE_PRIVATE)
 
-    // layers: base = none | warp | gool, then optional psiphon inside it, then optional proxy profile on top
-    fun base(c: Context) = sp(c).getString("base", "gool")!!
-    fun setBase(c: Context, v: String) = sp(c).edit().putString("base", v).apply()
-    fun psiphon(c: Context) = sp(c).getBoolean("psiphon", true)
-    fun setPsiphon(c: Context, v: Boolean) = sp(c).edit().putBoolean("psiphon", v).apply()
-    fun useProxy(c: Context) = sp(c).getBoolean("useProxy", false)
-    fun setUseProxy(c: Context, v: Boolean) = sp(c).edit().putBoolean("useProxy", v).apply()
+    // mode: auto | psiphon | warp | gool | v2ray
+    fun mode(c: Context) = sp(c).getString("mode", "auto")!!
+    fun setMode(c: Context, v: String) = sp(c).edit().putString("mode", v).apply()
+    // v2ray mode can optionally go through WARP/Gool first: none | warp | gool
+    fun via(c: Context) = sp(c).getString("via", "none")!!
+    fun setVia(c: Context, v: String) = sp(c).edit().putString("via", v).apply()
+    fun lastGood(c: Context) = sp(c).getString("lastGood", "")!!
+    fun setLastGood(c: Context, v: String) = sp(c).edit().putString("lastGood", v).apply()
 
     fun port(c: Context) = sp(c).getInt("port", 10808)
     fun setPort(c: Context, v: Int) = sp(c).edit().putInt("port", v).apply()

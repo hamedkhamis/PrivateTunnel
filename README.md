@@ -6,7 +6,8 @@
 TUN (VpnService) -> hev-socks5-tunnel (JNI) -> SOCKS5 محلی -> یکی از هسته‌ها:
 - sing-box: VLESS/Reality, VMess, Trojan, Shadowsocks, Hysteria2, TUIC و هر outbound دیگر (ShadowTLS, AnyTLS, Naive, WireGuard) با paste کردن JSON
 - warp-plus: WARP، Gool و Psiphon بدون سرور (Psiphon می‌تواند داخل WARP یا Gool اجرا شود)
-- زنجیره دلخواه: لایه پایه (WARP/Gool) ← Psiphon ← پروکسی V2Ray، هر ترکیبی که بخواهی
+- حالت خودکار: Psiphon، WARP و Gool را یکی‌یکی امتحان می‌کند و با درخواست واقعی اینترنت تست می‌کند
+- کانفیگ V2Ray می‌تواند اول از داخل WARP یا Gool رد شود (ترکیب Gool با Psiphon در خود warp-plus ممکن نیست)
 
 DNS به صورت mapdns از راه تونل حل می‌شود (نشت DNS ندارد). هات‌اسپات: همان پورت روی 0.0.0.0 باز می‌شود.
 

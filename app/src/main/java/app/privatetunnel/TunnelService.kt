@@ -9,10 +9,13 @@ import android.os.ParcelFileDescriptor
 import hev.htproxy.TProxyService
 import kotlinx.coroutines.flow.MutableStateFlow
 import java.io.File
+import java.net.HttpURLConnection
 import java.net.InetSocketAddress
 import java.net.NetworkInterface
+import java.net.Proxy
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.URL
 import java.util.concurrent.TimeUnit
 
 class TunnelService : VpnService() {
@@ -21,17 +24,25 @@ class TunnelService : VpnService() {
         val running = MutableStateFlow(false)
         val busy = MutableStateFlow(false)
         val status = MutableStateFlow("")
+        val method = MutableStateFlow("")
         val since = MutableStateFlow(0L)
-        val traffic = MutableStateFlow(0L to 0L) // up, down bytes
+        val traffic = MutableStateFlow(0L to 0L)
         val logs = MutableStateFlow<List<String>>(emptyList())
-        fun log(s: String) { logs.value = (logs.value + s).takeLast(600) }
+        fun log(s: String) { logs.value = (logs.value + s).takeLast(700) }
 
         fun hotspotAddresses(port: Int): List<String> = try {
             NetworkInterface.getNetworkInterfaces().toList().flatMap { it.inetAddresses.toList() }
                 .filter { !it.isLoopbackAddress && it.isSiteLocalAddress && it.address.size == 4 }
                 .map { "${it.hostAddress}:$port" }
         } catch (e: Exception) { emptyList() }
+
+        fun modeLabel(k: String) = when (k) {
+            "auto" -> "خودکار"; "psiphon" -> "Psiphon"; "warp" -> "WARP"; "gool" -> "Gool"
+            "v2ray" -> "کانفیگ V2Ray"; else -> k
+        }
     }
+
+    private data class Step(val key: String)
 
     private val procs = mutableListOf<Process>()
     private var tun: ParcelFileDescriptor? = null
@@ -48,7 +59,7 @@ class TunnelService : VpnService() {
             worker = Thread {
                 try { startAll() } catch (e: Exception) {
                     val m = e.message ?: "نامشخص"
-                    log("خطا: $m"); stopAll(); status.value = "خطا: $m"; stopSelf()
+                    log("خطا: $m"); stopAll(); status.value = if (cancelled) "" else "خطا: $m"; stopSelf()
                 } finally { busy.value = false }
             }.also { it.start() }
         }
@@ -79,46 +90,39 @@ class TunnelService : VpnService() {
         ServerSocket().use { it.reuseAddress = true; it.bind(InetSocketAddress("127.0.0.1", p)) }; true
     } catch (e: Exception) { false }
 
+    private fun steps(mode: String): List<Step> {
+        if (mode != "auto") return listOf(Step(mode))
+        val l = mutableListOf(Step("psiphon"), Step("warp"), Step("gool"))
+        if (Store.selectedProfile(this) != null) l += Step("v2ray")
+        val last = Store.lastGood(this)
+        l.sortBy { if (it.key == last) 0 else 1 }
+        return l
+    }
+
     private fun startAll() {
         cancelled = false
-        status.value = "آماده‌سازی..."
+        status.value = "آماده‌سازی..."; method.value = ""
         killProcs()
-
-        val base = Store.base(this); val psi = Store.psiphon(this); val useProxy = Store.useProxy(this)
-        val needWarp = base != "none" || psi
-        if (!needWarp && !useProxy) error("هیچ لایه‌ای انتخاب نشده")
         val port = Store.port(this)
         val listen = if (Store.hotspot(this)) "0.0.0.0" else "127.0.0.1"
         val dir = filesDir
         val cache = File(dir, "warp").apply { mkdirs() }
-        val warpPort = if (useProxy) port + 1 else port
         if (!portFree(port) || !portFree(port + 1)) error("پورت $port اشغال است (برنامه دیگری استفاده می‌کند)")
-        log("شروع: base=$base psiphon=$psi proxy=$useProxy port=$port listen=$listen")
+        if (assets.list("warp-seed")?.isNotEmpty() == true) copyAsset("warp-seed", cache)
+        val help = helpText()
 
-        if (needWarp) {
-            if (assets.list("warp-seed")?.isNotEmpty() == true) copyAsset("warp-seed", cache)
-            val help = helpText()
-            fun need(flag: String) { if (help.isNotEmpty() && !help.contains(flag)) error("این نسخه warp-plus از $flag پشتیبانی نمی‌کند") }
-            if (base == "gool") need("--gool")
-            if (psi) need("--cfon")
-            if (Store.endpoint(this).isNotBlank()) need("--endpoint")
-            if (Store.scan(this)) need("--scan")
-            val args = ConfigBuilder.warpArgs(base, psi, Store.country(this).ifBlank { "US" }, Store.scan(this),
-                help.contains("--rtt"), Store.endpoint(this), (if (useProxy) "127.0.0.1" else listen) + ":$warpPort", cache.path)
-            status.value = "اتصال به Cloudflare / اسکن endpoint (تا ۲ دقیقه)..."
-            startCore("warp", "libwarp.so", args, dir)
-            waitPort(warpPort, 150)
+        val list = steps(Store.mode(this))
+        var used = ""
+        for ((i, st) in list.withIndex()) {
+            if (cancelled) error("لغو شد")
+            val label = modeLabel(st.key)
+            status.value = if (list.size > 1) "تلاش ${i + 1} از ${list.size}: $label" else "اتصال با $label..."
+            log("--- تلاش: $label")
+            if (tryStep(st, port, listen, dir, cache, help)) { used = st.key; break }
+            killProcs()
         }
-        if (useProxy) {
-            val p = Store.selectedProfile(this) ?: error("پروفایلی انتخاب نشده")
-            val out = UriParser.parse(p.uri) ?: error("این لینک پشتیبانی نمی‌شود")
-            val cfg = File(dir, "sb.json").apply {
-                writeText(ConfigBuilder.singBox(out, listen, port, if (needWarp) warpPort else null))
-            }
-            status.value = "راه‌اندازی sing-box..."
-            startCore("sing-box", "libsingbox.so", listOf("run", "-c", cfg.path, "-D", dir.path), dir)
-            waitPort(port, 30)
-        }
+        if (used.isEmpty()) error("هیچ روشی وصل نشد. تب «تست» را ببین و بعد دوباره امتحان کن")
+        if (Store.mode(this) == "auto") Store.setLastGood(this, used)
         if (cancelled) error("لغو شد")
 
         status.value = "ساخت تونل..."
@@ -130,16 +134,79 @@ class TunnelService : VpnService() {
         val conf = File(dir, "hev.yml").apply { writeText(ConfigBuilder.hev(port)) }
         hev.start(conf.path, tun!!.fd)
         hevStarted = true
+        method.value = modeLabel(used)
         since.value = System.currentTimeMillis()
         running.value = true
         status.value = "متصل"
-        log("متصل شد")
+        log("متصل شد با ${modeLabel(used)}")
         Thread {
             while (running.value) {
                 try { hev.stats()?.let { traffic.value = it[1] to it[3] } } catch (_: Throwable) {}
                 Thread.sleep(1000)
             }
         }.start()
+    }
+
+    private fun warpArgs(base: String, psiphon: Boolean, bind: String, cache: File, help: String): List<String> {
+        fun need(flag: String) { if (help.isNotEmpty() && !help.contains(flag)) error("این نسخه warp-plus از $flag پشتیبانی نمی‌کند") }
+        if (base == "gool") need("--gool")
+        if (psiphon) need("--cfon")
+        val ep = Store.endpoint(this)
+        if (ep.isNotBlank()) need("--endpoint")
+        val scan = Store.scan(this) && ep.isBlank()
+        if (scan) need("--scan")
+        return ConfigBuilder.warpArgs(base, psiphon, Store.country(this).ifBlank { "US" }, scan,
+            help.contains("--rtt"), ep, bind, cache.path)
+    }
+
+    /** starts the cores for one method and checks that real traffic passes. false = try next */
+    private fun tryStep(st: Step, port: Int, listen: String, dir: File, cache: File, help: String): Boolean {
+        try {
+            when (st.key) {
+                "psiphon", "warp", "gool" -> {
+                    val args = warpArgs(if (st.key == "gool") "gool" else "warp", st.key == "psiphon", "$listen:$port", cache, help)
+                    startCore("warp", "libwarp.so", args, dir)
+                    status.value = status.value.substringBefore("\n") + "\nاسکن endpoint سالم، تا ۲ دقیقه صبر کن"
+                    waitPort(port, 120)
+                }
+                "v2ray" -> {
+                    val p = Store.selectedProfile(this) ?: error("کانفیگی انتخاب نشده (تب کانفیگ‌ها)")
+                    val out = UriParser.parse(p.uri) ?: error("این لینک پشتیبانی نمی‌شود")
+                    val via = Store.via(this)
+                    var warpPort: Int? = null
+                    if (via != "none") {
+                        warpPort = port + 1
+                        startCore("warp", "libwarp.so", warpArgs(via, false, "127.0.0.1:$warpPort", cache, help), dir)
+                        waitPort(warpPort, 120)
+                    }
+                    val cfg = File(dir, "sb.json").apply { writeText(ConfigBuilder.singBox(out, listen, port, warpPort)) }
+                    startCore("sing-box", "libsingbox.so", listOf("run", "-c", cfg.path, "-D", dir.path), dir)
+                    waitPort(port, 30)
+                }
+                else -> error("روش ناشناخته")
+            }
+            status.value = status.value.substringBefore("\n") + "\nبررسی اینترنت..."
+            if (!verify(port)) error("پورت بالا آمد ولی اینترنت از این مسیر کار نکرد")
+            return true
+        } catch (e: Exception) {
+            if (cancelled) throw e
+            log("ناموفق: ${e.message}")
+            return false
+        }
+    }
+
+    private fun verify(port: Int): Boolean {
+        val px = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", port))
+        repeat(3) {
+            if (cancelled) return false
+            try {
+                val c = URL("https://www.gstatic.com/generate_204").openConnection(px) as HttpURLConnection
+                c.connectTimeout = 8000; c.readTimeout = 8000
+                val code = c.responseCode; c.disconnect()
+                if (code in 200..399) { log("تست اینترنت OK (کد $code)"); return true }
+            } catch (e: Exception) { log("تست اینترنت: ${e.javaClass.simpleName}") }
+        }
+        return false
     }
 
     private fun startCore(name: String, lib: String, args: List<String>, dir: File) {
@@ -156,11 +223,11 @@ class TunnelService : VpnService() {
         val end = System.currentTimeMillis() + seconds * 1000L
         while (System.currentTimeMillis() < end) {
             if (cancelled) error("لغو شد")
-            if (procs.any { !it.isAlive }) error("هسته متوقف شد، تب لاگ را ببین")
+            if (procs.any { !it.isAlive }) error("هسته متوقف شد")
             try { Socket().use { it.connect(InetSocketAddress("127.0.0.1", port), 300) }; return }
             catch (_: Exception) { Thread.sleep(400) }
         }
-        error("پورت $port بالا نیامد (تایم‌اوت)")
+        error("پورت $port در $seconds ثانیه بالا نیامد")
     }
 
     private fun killProcs() {
@@ -175,8 +242,7 @@ class TunnelService : VpnService() {
         try { tun?.close() } catch (_: Exception) {}
         tun = null
         killProcs()
-        traffic.value = 0L to 0L
-        since.value = 0L
+        traffic.value = 0L to 0L; since.value = 0L; method.value = ""
         if (!status.value.startsWith("خطا")) status.value = ""
         log("قطع شد")
     }

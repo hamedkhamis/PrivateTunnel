@@ -30,7 +30,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Settings
@@ -50,6 +49,7 @@ import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextDirection
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -113,19 +113,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
-
-data class Preset(val label: String, val base: String, val psi: Boolean, val proxy: Boolean)
-
-private val PRESETS = listOf(
-    Preset("Gool + Psiphon", "gool", true, false),
-    Preset("WARP + Psiphon", "warp", true, false),
-    Preset("Gool", "gool", false, false),
-    Preset("WARP", "warp", false, false),
-    Preset("Psiphon", "none", true, false),
-    Preset("پروکسی", "none", false, true),
-    Preset("پروکسی روی Gool", "gool", false, true),
-    Preset("پروکسی روی Gool + Psiphon", "gool", true, true)
-)
 
 @Composable
 fun App(act: MainActivity) {
@@ -195,23 +182,34 @@ private fun fmt(b: Long): String = when {
 }
 
 @Composable
+fun LtrText(text: String, color: Color = MUTED, size: Int = 12, modifier: Modifier = Modifier, maxLines: Int = 2) {
+    Text(text, modifier, color = color, fontSize = size.sp, maxLines = maxLines,
+        style = LocalTextStyle.current.copy(textDirection = TextDirection.Ltr))
+}
+
+private val MODES = listOf(
+    Triple("auto", "خودکار (پیشنهادی)", "خودش Psiphon، WARP و Gool را یکی‌یکی امتحان می‌کند و اولین روش سالم را نگه می‌دارد"),
+    Triple("psiphon", "Psiphon", "برای فیلترینگ سخت؛ کشور خروجی از تنظیمات"),
+    Triple("warp", "WARP", "تونل ساده و سریع Cloudflare"),
+    Triple("gool", "Gool", "WARP دوبل؛ IP متفاوت"),
+    Triple("v2ray", "کانفیگ V2Ray", "یکی از کانفیگ‌ها را در تب «کانفیگ‌ها» انتخاب کن")
+)
+
+@Composable
 fun HomeTab(act: MainActivity) {
     val ctx = LocalContext.current
     val running by TunnelService.running.collectAsState()
     val busy by TunnelService.busy.collectAsState()
     val status by TunnelService.status.collectAsState()
+    val method by TunnelService.method.collectAsState()
     val since by TunnelService.since.collectAsState()
     val traffic by TunnelService.traffic.collectAsState()
-    var base by remember { mutableStateOf(Store.base(ctx)) }
-    var psi by remember { mutableStateOf(Store.psiphon(ctx)) }
-    var proxy by remember { mutableStateOf(Store.useProxy(ctx)) }
+    var mode by remember { mutableStateOf(Store.mode(ctx)) }
+    var via by remember { mutableStateOf(Store.via(ctx)) }
+    var adv by remember { mutableStateOf(false) }
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(running) { while (running) { now = System.currentTimeMillis(); delay(1000) } }
     val locked = running || busy
-    fun apply(b: String, p: Boolean, x: Boolean) {
-        base = b; psi = p; proxy = x
-        Store.setBase(ctx, b); Store.setPsiphon(ctx, p); Store.setUseProxy(ctx, x)
-    }
 
     val state = if (running) 2 else if (busy) 1 else 0
     val sec = if (running && since > 0) (now - since) / 1000 else 0
@@ -222,60 +220,42 @@ fun HomeTab(act: MainActivity) {
         Text("Private Tunnel", fontSize = 22.sp, fontWeight = FontWeight.Bold)
         PowerButton(state) { if (locked) act.disconnect() else act.connect() }
         Text(when (state) { 2 -> "متصل"; 1 -> "در حال اتصال..."; else -> "قطع" },
-            fontSize = 24.sp, fontWeight = FontWeight.Bold,
-            color = when (state) { 2 -> OK; 1 -> WARN; else -> TXT })
-        Text(if (state == 2) uptime else status.ifEmpty { "برای اتصال دکمه را لمس کن" },
-            color = if (status.startsWith("خطا")) ERR else MUTED, textAlign = TextAlign.Center, fontSize = 14.sp)
-
-        if (running) Card2 {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("آپلود", color = MUTED, fontSize = 12.sp); Text(fmt(traffic.first), fontWeight = FontWeight.Bold, color = ACCENT)
-                }
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("دانلود", color = MUTED, fontSize = 12.sp); Text(fmt(traffic.second), fontWeight = FontWeight.Bold, color = OK)
-                }
+            fontSize = 24.sp, fontWeight = FontWeight.Bold, color = when (state) { 2 -> OK; 1 -> WARN; else -> TXT })
+        if (state == 2) {
+            Text("با $method  ·  $uptime", color = MUTED)
+            Row(horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+                Text("↑ " + fmt(traffic.first), color = ACCENT, fontWeight = FontWeight.Bold)
+                Text("↓ " + fmt(traffic.second), color = OK, fontWeight = FontWeight.Bold)
             }
-        }
+        } else Text(status.ifEmpty { "دکمه را لمس کن" }, color = if (status.startsWith("خطا")) ERR else MUTED,
+            textAlign = TextAlign.Center, fontSize = 14.sp)
 
         Card2 {
-            Text("مسیر اتصال", fontWeight = FontWeight.Bold)
-            val nodes = buildList {
-                add("📱 گوشی")
-                if (base == "gool") add("Gool") else if (base == "warp") add("WARP")
-                if (psi) add("Psiphon ${Store.country(ctx)}")
-                if (proxy) add(Store.selectedProfile(ctx)?.name ?: "پروکسی (انتخاب نشده)")
-                add("🌐 اینترنت")
-            }
-            Row(Modifier.horizontalScroll(rememberScrollState()), verticalAlignment = Alignment.CenterVertically) {
-                nodes.forEachIndexed { i, n ->
-                    if (i > 0) Text("  ←  ", color = ACCENT, fontWeight = FontWeight.Bold)
-                    Box(Modifier.clip(RoundedCornerShape(12.dp)).background(CARD2).padding(horizontal = 12.dp, vertical = 8.dp)) {
-                        Text(n, maxLines = 1, fontSize = 13.sp)
+            Text("روش اتصال", fontWeight = FontWeight.Bold)
+            MODES.forEach { (k, title, desc) ->
+                val on = mode == k
+                Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(if (on) CARD2 else Color.Transparent)
+                    .clickable(enabled = !locked) { mode = k; Store.setMode(ctx, k) }.padding(horizontal = 8.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically) {
+                    RadioButton(selected = on, onClick = null, enabled = !locked)
+                    Spacer(Modifier.width(10.dp))
+                    Column {
+                        Text(title, fontWeight = FontWeight.Bold)
+                        Text(desc, color = MUTED, fontSize = 12.sp)
                     }
                 }
             }
-            if (psi) Text("Psiphon داخل تونل ${if (base == "none") "مستقیم" else if (base == "gool") "Gool" else "WARP"} اجرا می‌شود.",
-                color = MUTED, fontSize = 12.sp)
-        }
-
-        Card2 {
-            Text("ترکیب‌های آماده", fontWeight = FontWeight.Bold)
-            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                PRESETS.forEach { p ->
-                    FilterChip(selected = p.base == base && p.psi == psi && p.proxy == proxy, enabled = !locked,
-                        onClick = { apply(p.base, p.psi, p.proxy) }, label = { Text(p.label) },
-                        colors = FilterChipDefaults.filterChipColors(selectedContainerColor = ACCENT, selectedLabelColor = Color.White))
+            TextButton(onClick = { adv = !adv }) { Text(if (adv) "بستن گزینه‌های پیشرفته" else "گزینه‌های پیشرفته") }
+            if (adv) {
+                Text("کانفیگ V2Ray اول از داخل چه تونلی رد شود؟", color = MUTED, fontSize = 12.sp)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf("none" to "مستقیم", "warp" to "WARP", "gool" to "Gool").forEach { (k, v) ->
+                        FilterChip(selected = via == k, enabled = !locked,
+                            onClick = { via = k; Store.setVia(ctx, k) }, label = { Text(v) })
+                    }
                 }
+                Text("ترکیب Gool با Psiphon توسط هسته پشتیبانی نمی‌شود.", color = MUTED, fontSize = 11.sp)
             }
-            Text("لایه پایه", color = MUTED, fontSize = 12.sp)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                listOf("none" to "بدون", "warp" to "WARP", "gool" to "Gool").forEach { (k, v) ->
-                    FilterChip(selected = base == k, enabled = !locked, onClick = { apply(k, psi, proxy) }, label = { Text(v) })
-                }
-            }
-            SwitchRow("Psiphon داخل لایه پایه", psi, !locked) { apply(base, it, proxy) }
-            SwitchRow("پروکسی (V2Ray) روی مسیر", proxy, !locked) { apply(base, psi, it) }
         }
 
         if (running && Store.hotspot(ctx)) {
@@ -283,7 +263,7 @@ fun HomeTab(act: MainActivity) {
             Card2 {
                 Text("اشتراک با لپ‌تاپ", fontWeight = FontWeight.Bold)
                 Text("در v2rayN یک سرور SOCKS5 با این آدرس بساز:", color = MUTED, fontSize = 12.sp)
-                addrs.forEach { Text(it, fontFamily = FontFamily.Monospace, fontSize = 20.sp, color = OK) }
+                addrs.forEach { LtrText(it, OK, 20) }
                 if (addrs.isEmpty()) Text("آدرسی پیدا نشد. هات‌اسپات را روشن کن.", color = WARN)
             }
         }
@@ -443,58 +423,60 @@ fun TestTab() {
     val clean by NetTest.clean.collectAsState()
     val scanning by NetTest.scanning.collectAsState()
     var applied by remember { mutableStateOf(false) }
+    var details by remember { mutableStateOf(false) }
     Column(Modifier.verticalScroll(rememberScrollState()).padding(vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("تست شبکه", fontSize = 22.sp, fontWeight = FontWeight.Bold)
-        Text("ببین اینترنت فعلی تو چه چیزهایی را عبور می‌دهد: DNS، UDP، پورت‌ها، SNI و سایت‌ها.",
-            color = MUTED, fontSize = 13.sp)
-        Button(onClick = { scope.launch { NetTest.run(ctx) } }, enabled = !running, modifier = Modifier.fillMaxWidth()) {
-            Text(if (running) "در حال تست..." else "شروع تست")
-        }
+        Text("ببین اینترنت فعلی چه چیزهایی را عبور می‌دهد.", color = MUTED, fontSize = 13.sp)
+        Button(onClick = { applied = false; scope.launch { NetTest.run(ctx) } }, enabled = !running,
+            modifier = Modifier.fillMaxWidth()) { Text(if (running) "در حال تست..." else "شروع تست") }
         if (running) LinearProgressIndicator(Modifier.fillMaxWidth())
 
         if (summary.isNotEmpty()) Card2 {
             Text("نتیجه", fontWeight = FontWeight.Bold)
-            summary.forEach { Text("• $it", fontSize = 13.sp) }
-            suggestion?.let { sg ->
-                Button(onClick = {
-                    Store.setBase(ctx, sg.base); Store.setPsiphon(ctx, sg.psi); Store.setUseProxy(ctx, sg.proxy); applied = true
-                }) { Text("اعمال پیشنهاد: ${sg.label}") }
+            summary.forEach { Text(it, fontSize = 14.sp) }
+            suggestion?.let { m ->
+                Button(onClick = { Store.setMode(ctx, m); applied = true }) {
+                    Text("پیشنهاد: " + TunnelService.modeLabel(m) + " (اعمال کن)")
+                }
                 if (applied) Text("اعمال شد. به تب اتصال برو.", color = OK, fontSize = 12.sp)
             }
         }
 
-        rows.groupBy { it.group }.forEach { (g, list) ->
-            Card2 {
-                Text(g, fontWeight = FontWeight.Bold)
-                list.forEach { r ->
-                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Text(when (r.ok) { true -> "✅"; false -> "❌"; null -> "⏳" })
-                        Spacer(Modifier.width(8.dp))
-                        Text(r.name, Modifier.weight(1f), fontSize = 13.sp, maxLines = 1)
-                        Text(r.detail, color = if (r.ok == false) ERR else MUTED, fontSize = 11.sp, maxLines = 1)
+        TextButton(onClick = { details = !details }) { Text(if (details) "پنهان کردن جزئیات" else "نمایش جزئیات و ابزارها") }
+        if (details) {
+            rows.groupBy { it.group }.forEach { (g, list) ->
+                Card2 {
+                    Text(g, fontWeight = FontWeight.Bold)
+                    list.forEach { r ->
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
+                            Text(when (r.ok) { true -> "✅"; false -> "❌"; null -> "⏳" })
+                            Spacer(Modifier.width(8.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(r.name, fontSize = 13.sp)
+                                LtrText(r.detail, if (r.ok == false) ERR else MUTED, 11)
+                            }
+                        }
                     }
                 }
             }
-        }
-
-        Card2 {
-            Text("اسکن IP تمیز Cloudflare", fontWeight = FontWeight.Bold)
-            Text("برای کانفیگ‌هایی که پشت CDN هستند (WS/gRPC روی Cloudflare) آدرس سریع‌تر پیدا می‌کند.",
-                color = MUTED, fontSize = 12.sp)
-            Button(onClick = { scope.launch { NetTest.scanClean() } }, enabled = !scanning) {
-                Text(if (scanning) "در حال اسکن..." else "شروع اسکن")
-            }
-            if (scanning) LinearProgressIndicator(Modifier.fillMaxWidth())
-            val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-            clean.forEach { (ip, ms) ->
-                Row(Modifier.fillMaxWidth().clickable { cm.setPrimaryClip(ClipData.newPlainText("ip", ip)) },
-                    verticalAlignment = Alignment.CenterVertically) {
-                    Text(ip, fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f))
-                    Text("$ms ms", color = OK)
+            Card2 {
+                Text("اسکن IP تمیز Cloudflare", fontWeight = FontWeight.Bold)
+                Text("برای کانفیگ‌هایی که پشت CDN هستند، آدرس سریع‌تر پیدا می‌کند.", color = MUTED, fontSize = 12.sp)
+                Button(onClick = { scope.launch { NetTest.scanClean() } }, enabled = !scanning) {
+                    Text(if (scanning) "در حال اسکن..." else "شروع اسکن")
                 }
+                if (scanning) LinearProgressIndicator(Modifier.fillMaxWidth())
+                val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                clean.forEach { (ip, ms) ->
+                    Row(Modifier.fillMaxWidth().clickable { cm.setPrimaryClip(ClipData.newPlainText("ip", ip)) },
+                        verticalAlignment = Alignment.CenterVertically) {
+                        LtrText(ip, TXT, 15, Modifier.weight(1f), 1)
+                        Text("$ms ms", color = OK)
+                    }
+                }
+                if (clean.isNotEmpty()) Text("برای کپی روی هر IP بزن.", color = MUTED, fontSize = 11.sp)
             }
-            if (clean.isNotEmpty()) Text("برای کپی روی هر IP بزن.", color = MUTED, fontSize = 11.sp)
         }
     }
 }
@@ -529,8 +511,6 @@ fun CollectorTab() {
     val results by Collector.results.collectAsState()
     var sort by remember { mutableStateOf("ping") }
     var country by remember { mutableStateOf("") }
-    var limit by remember { mutableIntStateOf(400) }
-    var extra by remember { mutableStateOf("") }
     var msg by remember { mutableStateOf("") }
 
     val countries = results.map { it.cc }.filter { it.isNotEmpty() }.groupingBy { it }.eachCount()
@@ -539,65 +519,49 @@ fun CollectorTab() {
         when (sort) {
             "speed" -> l.sortedByDescending { it.speed }
             "country" -> l.sortedWith(compareBy({ it.cc }, { it.delay }))
-            "proto" -> l.sortedWith(compareBy({ it.proto }, { it.delay }))
             else -> l.sortedBy { it.delay }
         }
     }
 
     fun use(c: Cfg) {
         val i = Store.addProfile(ctx, Profile(c.name, c.uri))
-        Store.setSelected(ctx, i); Store.setUseProxy(ctx, true)
-        msg = "«${c.name.take(30)}» انتخاب شد. در تب اتصال لایه پروکسی فعال است."
+        Store.setSelected(ctx, i); Store.setMode(ctx, "v2ray")
+        msg = "انتخاب شد. حالا به تب اتصال برو و وصل شو."
     }
 
     Column(Modifier.fillMaxSize().padding(top = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("پیدا کردن کانفیگ سالم", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+        Text("لیست‌های عمومی را می‌گیرد و هر کانفیگ را واقعاً تست می‌کند. چند دقیقه طول می‌کشد.",
+            color = MUTED, fontSize = 12.sp)
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-            if (!running) Button(onClick = { scope.launch { Collector.run(ctx, limit) } }, enabled = !speedRunning) {
-                Text("جمع‌آوری و تست")
+            if (!running) Button(onClick = { msg = ""; scope.launch { Collector.run(ctx, 300) } }, enabled = !speedRunning) {
+                Text("شروع")
             } else Button(onClick = { Collector.cancel() }, colors = ButtonDefaults.buttonColors(containerColor = ERR)) {
                 Text("توقف")
             }
-            OutlinedButton(onClick = { scope.launch { Collector.speedTest(ctx) } },
-                enabled = !running && !speedRunning && results.isNotEmpty()) {
-                Text(if (speedRunning) "در حال تست..." else "تست سرعت ۱۲ تای اول")
-            }
+            if (results.isNotEmpty()) OutlinedButton(onClick = { scope.launch { Collector.speedTest(ctx) } },
+                enabled = !running && !speedRunning) { Text(if (speedRunning) "در حال تست..." else "تست سرعت ۱۲ تای اول") }
         }
-        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp),
-            verticalAlignment = Alignment.CenterVertically) {
-            Text("تعداد تست:", color = MUTED, fontSize = 12.sp)
-            listOf(200, 400, 800, 1500).forEach {
-                FilterChip(selected = limit == it, enabled = !running, onClick = { limit = it }, label = { Text("$it") })
-            }
-        }
-        if (running || speedRunning || phase.isNotEmpty()) {
-            Text(phase, fontSize = 13.sp, color = if (phase.startsWith("خطا")) ERR else MUTED)
-            if (running && progress.second > 0)
-                LinearProgressIndicator(progress = { progress.first / progress.second.toFloat() }, modifier = Modifier.fillMaxWidth())
-            if (progress.second > 0) Text("تست‌شده ${progress.first} از ${progress.second}  ·  سالم: $alive", fontSize = 12.sp)
+        if (phase.isNotEmpty()) Text(phase, fontSize = 13.sp, color = if (phase.startsWith("خطا") || phase.startsWith("هیچ")) ERR else MUTED)
+        if (running && progress.second > 0) {
+            LinearProgressIndicator(progress = { progress.first / progress.second.toFloat() }, modifier = Modifier.fillMaxWidth())
+            Text("بررسی‌شده ${progress.first} از ${progress.second}  ·  سالم: $alive", fontSize = 12.sp)
         }
         if (msg.isNotEmpty()) Text(msg, color = OK, fontSize = 12.sp)
 
         if (results.isNotEmpty()) {
             Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalAlignment = Alignment.CenterVertically) {
-                Text("مرتب‌سازی:", color = MUTED, fontSize = 12.sp)
-                listOf("ping" to "پینگ", "speed" to "سرعت", "country" to "کشور", "proto" to "پروتکل").forEach { (k, v) ->
+                listOf("ping" to "پینگ", "speed" to "سرعت", "country" to "کشور").forEach { (k, v) ->
                     FilterChip(selected = sort == k, onClick = { sort = k }, label = { Text(v) })
                 }
-            }
-            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp),
-                verticalAlignment = Alignment.CenterVertically) {
-                FilterChip(selected = country.isEmpty(), onClick = { country = "" }, label = { Text("همه (${results.size})") })
+                Text("|", color = MUTED)
+                FilterChip(selected = country.isEmpty(), onClick = { country = "" }, label = { Text("همه") })
                 countries.forEach { cc ->
                     FilterChip(selected = country == cc, onClick = { country = if (country == cc) "" else cc },
-                        label = { Text(flagOf(cc) + " " + cc + " " + results.count { it.cc == cc }) })
+                        label = { Text(flagOf(cc) + " " + results.count { it.cc == cc }) })
                 }
             }
-            OutlinedButton(onClick = {
-                val top = shown.take(10)
-                top.forEach { Store.addProfile(ctx, Profile(it.name, it.uri)) }
-                msg = "${top.size} کانفیگ برتر به لیست ذخیره‌شده اضافه شد"
-            }) { Text("افزودن ۱۰ تای اول به ذخیره‌شده‌ها") }
         }
 
         LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -608,32 +572,15 @@ fun CollectorTab() {
                     Text(flagOf(c.cc), fontSize = 24.sp)
                     Spacer(Modifier.width(10.dp))
                     Column(Modifier.weight(1f)) {
-                        Text(c.name, maxLines = 1, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                        LtrText(c.name, TXT, 13, maxLines = 1)
                         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             Text(c.proto.uppercase(), color = MUTED, fontSize = 11.sp)
                             Text("${c.delay} ms", fontSize = 11.sp,
-                                color = if (c.delay < 400) OK else if (c.delay < 1000) WARN else ERR)
+                                color = if (c.delay < 800) OK else if (c.delay < 2000) WARN else ERR)
                             if (c.speed >= 0) Text(String.format(Locale.US, "%.1f Mbps", c.speed), fontSize = 11.sp, color = ACCENT)
                         }
                     }
-                    TextButton(onClick = { use(c) }) { Text("استفاده") }
-                    IconButton(onClick = { Store.addProfile(ctx, Profile(c.name, c.uri)); msg = "اضافه شد" }) {
-                        Icon(Icons.Filled.Add, null, tint = ACCENT)
-                    }
-                }
-            }
-            item {
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(vertical = 10.dp)) {
-                    Text("منبع دلخواه (لینک ساب)", color = MUTED, fontSize = 12.sp)
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedTextField(value = extra, onValueChange = { extra = it }, singleLine = true,
-                            modifier = Modifier.weight(1f), placeholder = { Text("https://...") })
-                        Button(onClick = {
-                            if (extra.startsWith("http")) { Store.addExtraSource(ctx, extra); extra = ""; msg = "منبع اضافه شد" }
-                        }) { Text("افزودن") }
-                    }
-                    Text("سایت‌های مختلف روی Cloudflare کشور واقعی را نشان نمی‌دهند؛ کشور بر اساس نام یا IP سرور است.",
-                        color = MUTED, fontSize = 11.sp)
+                    Button(onClick = { use(c) }) { Text("اتصال") }
                 }
             }
         }
